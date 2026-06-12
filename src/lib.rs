@@ -45,6 +45,12 @@ pub trait ScreenFns {
     fn on_message(handle: &mut ScreenHandle, dict: &AppMessageDict);
 
     fn on_create(_handle: &mut ScreenHandle) {}
+    /// Called after the window is fully loaded and rendered, once the phone signals
+    /// it is ready to receive messages (via `taconite_window_id: 0` sentinel). If
+    /// the phone is already ready when this screen is pushed, it fires immediately.
+    /// Use this for sending subscribe/init messages to the phone; use `on_create`
+    /// for one-time setup like timers and clock subscriptions.
+    fn on_messaging_initialized(_handle: &mut ScreenHandle) {}
     fn on_appear(_handle: &mut ScreenHandle) {}
     fn on_disappear(_handle: &mut ScreenHandle) {}
     fn on_drop(_handle: &mut ScreenHandle) {}
@@ -92,15 +98,16 @@ impl ScreenHandle {
 // ── Internal bundle stored in window user data ────────────────────────────────
 
 struct ScreenBundle {
-    handle:           ScreenHandle,
-    window_id:        u8,
-    on_load:          fn(&mut ScreenHandle, *mut ()),
-    on_message:       fn(&mut ScreenHandle, &AppMessageDict),
-    on_appear:        fn(&mut ScreenHandle),
-    on_disappear:     fn(&mut ScreenHandle),
-    on_drop:          fn(&mut ScreenHandle),
-    configure_clicks: fn(&window::Window, *mut ScreenHandle) -> Option<WindowClickHandler<ScreenHandle>>,
-    click_handler:    Option<WindowClickHandler<ScreenHandle>>,
+    handle:                   ScreenHandle,
+    window_id:                u8,
+    on_load:                  fn(&mut ScreenHandle, *mut ()),
+    on_message:               fn(&mut ScreenHandle, &AppMessageDict),
+    on_messaging_initialized: fn(&mut ScreenHandle),
+    on_appear:                fn(&mut ScreenHandle),
+    on_disappear:             fn(&mut ScreenHandle),
+    on_drop:                  fn(&mut ScreenHandle),
+    configure_clicks:         fn(&window::Window, *mut ScreenHandle) -> Option<WindowClickHandler<ScreenHandle>>,
+    click_handler:            Option<WindowClickHandler<ScreenHandle>>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -112,6 +119,7 @@ struct RouterEntry {
 
 static mut ROUTER: alloc::vec::Vec<RouterEntry> = alloc::vec::Vec::new();
 static mut WINDOW_ID_COUNTER: u8 = 0;
+static mut MESSAGING_INITIALIZED: bool = false;
 
 fn next_window_id() -> u8 {
     unsafe {
@@ -157,13 +165,14 @@ pub fn push_screen_with<S: ScreenFns>(initial_state: S::State, animate: bool) {
     let bundle = Box::new(ScreenBundle {
         handle,
         window_id,
-        on_load:          on_load_trampoline::<S>,
-        on_message:       on_message_trampoline::<S>,
-        on_appear:        on_appear_trampoline::<S>,
-        on_disappear:     on_disappear_trampoline::<S>,
-        on_drop:          on_drop_trampoline::<S>,
-        configure_clicks: configure_clicks_trampoline::<S>,
-        click_handler:    None,
+        on_load:                  on_load_trampoline::<S>,
+        on_message:               on_message_trampoline::<S>,
+        on_messaging_initialized: on_messaging_initialized_trampoline::<S>,
+        on_appear:                on_appear_trampoline::<S>,
+        on_disappear:             on_disappear_trampoline::<S>,
+        on_drop:                  on_drop_trampoline::<S>,
+        configure_clicks:         configure_clicks_trampoline::<S>,
+        click_handler:            None,
     });
     let bundle_ptr = Box::into_raw(bundle);
 
@@ -180,13 +189,27 @@ pub fn push_screen_with<S: ScreenFns>(initial_state: S::State, animate: bool) {
 }
 
 /// Global AppMessage inbox handler — register this with `AppMessage::register_inbox`.
-/// Routes incoming messages to the screen identified by `WINDOW_ID_KEY`.
+///
+/// A message with `taconite_window_id: 0` is the phone-ready sentinel: it sets the
+/// `MESSAGING_INITIALIZED` flag and calls `on_messaging_initialized` on every active
+/// screen. All other messages are routed to the screen whose window ID matches.
 pub extern "C" fn message_received(dict_ptr: DictPtr, _ctx: VoidPtr) {
     let dict = AppMessageDict::from_raw(dict_ptr);
     let window_id = match dict.find_i32(WINDOW_ID_KEY) {
         Some(id) => id as u8,
         None => return,
     };
+
+    if window_id == 0 {
+        unsafe {
+            MESSAGING_INITIALIZED = true;
+            for e in &mut *core::ptr::addr_of_mut!(ROUTER) {
+                let bundle = &mut *e.bundle_ptr;
+                (bundle.on_messaging_initialized)(&mut bundle.handle);
+            }
+        }
+        return;
+    }
 
     unsafe {
         for e in &mut *core::ptr::addr_of_mut!(ROUTER) {
@@ -256,10 +279,18 @@ fn on_load_trampoline<S: ScreenFns>(handle: &mut ScreenHandle, window_ptr: *mut 
     S::on_create(handle);
     // Initial render with default state
     (handle.view_fn)(handle.state_ptr as *const (), handle.layers_ptr as *const ());
+    // If the phone is already ready, fire immediately; otherwise wait for the sentinel.
+    if unsafe { *core::ptr::addr_of!(MESSAGING_INITIALIZED) } {
+        S::on_messaging_initialized(handle);
+    }
 }
 
 fn on_message_trampoline<S: ScreenFns>(handle: &mut ScreenHandle, dict: &AppMessageDict) {
     S::on_message(handle, dict);
+}
+
+fn on_messaging_initialized_trampoline<S: ScreenFns>(handle: &mut ScreenHandle) {
+    S::on_messaging_initialized(handle);
 }
 
 fn on_appear_trampoline<S: ScreenFns>(handle: &mut ScreenHandle) {
