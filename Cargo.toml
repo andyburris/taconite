@@ -1,0 +1,7 @@
+[package]
+name = "taconite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pebble-rust = { path = "../pebble-rust" }
