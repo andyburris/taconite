@@ -1,9 +1,35 @@
 import os.path
 import os
 import glob
+import json
+import subprocess
 
 top = '.'
 out = 'build'
+
+
+def find_pebble_rust_c(ctx):
+    # Locate pebble-rust's C platform shims (_pbl_is_color / _pbl_is_rect / …) via
+    # cargo, so this tracks the crate's real Cargo.toml dependency path and still
+    # works if this project is moved. Fail loudly — a silently-missing shim must not
+    # surface later as a confusing link error.
+    meta = subprocess.run(['cargo', 'metadata', '--format-version', '1'],
+                          cwd=ctx.path.abspath(),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    if meta.returncode != 0:
+        ctx.fatal('cargo metadata failed while locating pebble-rust:\n' + meta.stderr)
+    pkgs = [p for p in json.loads(meta.stdout)['packages'] if p['name'] == 'pebble-rust']
+    if not pkgs:
+        ctx.fatal('pebble-rust not found in cargo metadata — is it a dependency of this crate?')
+    c_dir_path = os.path.join(os.path.dirname(pkgs[0]['manifest_path']), 'c')
+    c_dir = ctx.root.find_dir(c_dir_path)
+    if c_dir is None:
+        ctx.fatal('pebble-rust C shim directory not found: ' + c_dir_path)
+    c_files = c_dir.ant_glob('**/*.c')
+    if not c_files:
+        ctx.fatal('no C sources found in ' + c_dir_path)
+    return c_files
+
 
 def options(ctx):
     ctx.load('pebble_sdk')
@@ -13,6 +39,8 @@ def configure(ctx):
 
 def build(ctx):
     ctx.load('pebble_sdk')
+
+    pebble_rust_c = find_pebble_rust_c(ctx)
 
     build_worker = os.path.exists('worker_src')
     binaries = []
@@ -32,7 +60,7 @@ def build(ctx):
         ctx.env.LINKFLAGS += glob.glob('../target/thumbv7m-none-eabi/release/deps/*.o')
         os.chdir('..')
         
-        ctx.pbl_program(source=ctx.path.ant_glob('target/thumbv7m-none-eabi/release/deps/*.o'),
+        ctx.pbl_program(source=ctx.path.ant_glob('target/thumbv7m-none-eabi/release/deps/*.o') + pebble_rust_c,
         target=app_elf)
 
         if build_worker:
