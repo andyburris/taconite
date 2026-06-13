@@ -24,11 +24,6 @@ pub struct AppMessageState {
     text: alloc::ffi::CString,
 }
 
-impl Default for AppMessageState {
-    fn default() -> Self {
-        Self { text: "Loading...".to_cstring() }
-    }
-}
 
 pub struct AppMessageLayers {
     text_layer: TextLayer,
@@ -55,7 +50,7 @@ impl ScreenFns for AppMessageScreen {
 
     fn on_messaging_initialized(handle: &mut ScreenHandle) {
         // Send our window ID to the phone so it knows where to route replies.
-        taconite::send_message(&[(taconite::WINDOW_ID_KEY, handle.window_id as i32)]);
+        taconite::send_message(&[(taconite::TaconiteMessageKey::WindowId as u32, handle.window_id as i32)]);
     }
 
     fn on_message(handle: &mut ScreenHandle, dict: &AppMessageDict) {
@@ -77,7 +72,7 @@ pub fn main() -> isize {
     AppMessage::register_inbox(taconite::message_received);
 
     let app = app::App::new();
-    taconite::push_screen::<AppMessageScreen>(false);
+    taconite::push_screen::<AppMessageScreen>(AppMessageState { text: "Loading...".to_cstring() }, false);
     app.run_event_loop();
 
     pbl_log!("Exiting.");

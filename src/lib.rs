@@ -19,16 +19,25 @@ use pebble::types::{DictPtr, VoidPtr};
 use pebble::layer::{Layer, ILayer};
 use pebble::click::WindowClickHandler;
 
-// The message key taconite reserves for routing AppMessages to the correct
-// screen. Apps must include `"taconite_window_id": 0` in their package.json
-// messageKeys, and the phone-side TypeScript must include this key in every
-// outbound AppMessage sent to the watch.
-pub const WINDOW_ID_KEY: u32 = 0;
+/// Message keys reserved by taconite. Include all of these in your app's
+/// `messageKeys` in `package.json` with the exact numeric values shown.
+///
+/// - `WindowId`  = 0x5441434F (1413563215) — `"taconite_window_id"`
+/// - `ItemIndex` = 0x54414350 (1413563216) — `"taconite_item_index"`
+/// - `ItemTotal` = 0x54414351 (1413563217) — `"taconite_item_total"`
+///
+/// A phone-side message with `WindowId = 0` is the phone-ready sentinel that
+/// triggers `on_messaging_initialized` on all active screens.
+pub enum TaconiteMessageKey {
+    WindowId  = 0x5441_434F,
+    ItemIndex = 0x5441_4350,
+    ItemTotal = 0x5441_4351,
+}
 
 // ── Public trait ─────────────────────────────────────────────────────────────
 
 pub trait ScreenFns {
-    type State: Default;
+    type State;
     type Layers;
 
     /// Called inside Pebble's load handler. Create all layers, add them to
@@ -142,12 +151,8 @@ fn router_unregister(window_id: u8) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Push a new screen onto the Pebble window stack.
-pub fn push_screen<S: ScreenFns>(animate: bool) {
-    push_screen_with::<S>(S::State::default(), animate);
-}
-
-pub fn push_screen_with<S: ScreenFns>(initial_state: S::State, animate: bool) {
+/// Push a new screen onto the Pebble window stack with the given initial state.
+pub fn push_screen<S: ScreenFns>(initial_state: S::State, animate: bool) {
     let state_ptr = Box::into_raw(Box::new(initial_state)) as *mut ();
     let window_id = next_window_id();
     let win = window::Window::new();
@@ -195,7 +200,7 @@ pub fn push_screen_with<S: ScreenFns>(initial_state: S::State, animate: bool) {
 /// screen. All other messages are routed to the screen whose window ID matches.
 pub extern "C" fn message_received(dict_ptr: DictPtr, _ctx: VoidPtr) {
     let dict = AppMessageDict::from_raw(dict_ptr);
-    let window_id = match dict.find_i32(WINDOW_ID_KEY) {
+    let window_id = match dict.find_i32(TaconiteMessageKey::WindowId as u32) {
         Some(id) => id as u8,
         None => return,
     };
@@ -220,6 +225,45 @@ pub extern "C" fn message_received(dict_ptr: DictPtr, _ctx: VoidPtr) {
             }
         }
     }
+}
+
+/// Receive a paged list over AppMessage.
+///
+/// Builds `vec` incrementally as chunks arrive. Returns `true` when the final
+/// item has been received (or when the list is empty). Callers should re-render
+/// only on `true`.
+///
+/// Typical usage inside `on_message`:
+/// ```ignore
+/// if taconite::handle_list_message(&mut state.items, dict, |d| MyItem::parse(d)) {
+///     // list is complete
+/// }
+/// ```
+pub fn handle_list_message<T>(
+    vec: &mut alloc::vec::Vec<Option<T>>,
+    dict: &AppMessageDict,
+    parse_item: impl Fn(&AppMessageDict) -> T,
+) -> bool {
+    let index = dict.find_i32(TaconiteMessageKey::ItemIndex as u32);
+    let total = dict.find_i32(TaconiteMessageKey::ItemTotal as u32).unwrap_or(0);
+
+    if total == 0 || index.is_none() || (index.unwrap() >= total) {
+        vec.clear();
+        return true;
+    }
+
+    let index = index.unwrap();
+    let item = parse_item(dict);
+
+    if index == 0 {
+        vec.clear();
+        vec.resize_with(total as usize, || None);
+    }
+    if let Some(slot) = vec.get_mut(index as usize) {
+        *slot = Some(item);
+    }
+
+    index + 1 >= total
 }
 
 /// Send a small AppMessage from watch to phone (key-value pairs of i32).

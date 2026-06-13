@@ -19,7 +19,9 @@
     "projectType": "native",
     "uuid": "19a34205-309a-47fc-8833-30fd68f685f7",
     "messageKeys": {
-      "taconite_window_id": 0,
+      "taconite_window_id": 1413563215,
+      "ItemIndex": 1413563216,
+      "ItemTotal": 1413563217,
       "App_ExampleKey": 1768777472
     },
     "enableMultiJS": false,

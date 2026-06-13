@@ -1,3 +1,13 @@
+// mirror your package.json keys here
+export enum MessageKey {
+    // First screen
+
+    // Taconite
+    taconite_window_id = 1413563215,
+    ItemIndex = 1413563216,
+    ItemTotal = 1413563217
+}
+
 // Signal the watch that the phone is ready; taconite will call
 // on_messaging_initialized on all active screens so they send their window IDs.
 Pebble.addEventListener('ready', async () => {
