@@ -7,17 +7,27 @@ extern crate pebble_rust as pebble;
 // Taconite — reactive screen framework for Pebble apps built with pebble-rust.
 //
 // Each screen is a zero-size type implementing `ScreenFns`.  At runtime, state
-// and layers live in heap allocations tracked by a `ScreenBundle` stored in
-// the Pebble window's user-data slot.  A small router table maps window IDs
-// to bundles so AppMessages can be delivered to the correct screen even when
-// it is not at the front of the stack.
+// lives in a single `Rc<RefCell<State>>` owned by a typed `ScreenCtx<State>`,
+// and layers read it (by reference, at paint time) through that context.  A
+// small router table maps window IDs to bundles so AppMessages can be delivered
+// to the correct screen even when it is not at the front of the stack.
+
+pub mod cell;
+pub mod layer;
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
+use core::cell::Cell;
+use cell::ReCell;
+
 use pebble::{window, WindowPtr};
 use pebble::app_message::{AppMessage, AppMessageDict, Dictionary};
 use pebble::types::{DictPtr, VoidPtr};
-use pebble::layer::{Layer, ILayer};
-use pebble::click::WindowClickHandler;
+use pebble::layer::Layer;
+use pebble::click::{ClickCallbacks, WindowClickHandler};
+
+/// State shared between a screen and its layers. Cloning is a cheap refcount bump.
+pub type Shared<S> = Rc<ReCell<S>>;
 
 /// Message keys reserved by taconite. Include all of these in your app's
 /// `messageKeys` in `package.json` with the exact numeric values shown.
@@ -34,92 +44,104 @@ pub enum TaconiteMessageKey {
     ItemTotal = 0x5441_4351,
 }
 
-// ── Public trait ─────────────────────────────────────────────────────────────
+// ── ScreenCtx — typed, handed to every screen method ───────────────────────────
+
+/// The per-screen context. Holds the shared state and the window's layers, and
+/// is what every `ScreenFns` method receives. App code sees only `&S` / `&mut S`
+/// through it — `Rc`/`RefCell`/raw pointers never surface.
+pub struct ScreenCtx<S> {
+    state:         Shared<S>,
+    pub window_id: u8,
+    root:          Layer,
+    window:        window::Window,
+    layers_ptr:    Cell<*const ()>,                                   // type-erased Layers, set after build
+    view_fn:       fn(&S, *const ()),                                 // monomorphized -> Sc::view
+    click:         ReCell<Option<WindowClickHandler<ScreenCtx<S>>>>, // kept alive for the screen's life
+}
+
+impl<S> ScreenCtx<S> {
+    /// A cheap shared handle to the state, for layer wrappers.
+    pub fn shared(&self) -> Shared<S> { self.state.clone() }
+
+    pub fn root(&self) -> &Layer { &self.root }
+    pub fn window(&self) -> &window::Window { &self.window }
+
+    /// Read the state.
+    pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> R {
+        f(&self.state.borrow())
+    }
+
+    /// The window's layers, if they have been built yet.
+    pub fn layers<L>(&self) -> Option<&L> {
+        let lp = self.layers_ptr.get();
+        if lp.is_null() { None } else { Some(unsafe { &*(lp as *const L) }) }
+    }
+
+    /// Mutate the state with `f`; if `f` returns `true`, re-render via `view`.
+    /// The `bool` gates re-render so a screen doesn't flicker through partially
+    /// assembled state (e.g. a list arriving over several AppMessages).
+    pub fn update(&self, f: impl FnOnce(&mut S) -> bool) {
+        let rerender = f(&mut self.state.borrow_mut());   // borrow_mut dropped at the `;`
+        if rerender {
+            let lp = self.layers_ptr.get();
+            if !lp.is_null() {
+                (self.view_fn)(&self.state.borrow(), lp);  // safe to borrow() now
+            }
+        }
+    }
+
+    /// Wire up click handlers for this screen. Call from `configure_clicks`.
+    /// Callbacks receive `&mut ScreenCtx<S>` and typically call `ctx.update(...)`.
+    pub fn set_clicks(&self, callbacks: ClickCallbacks<ScreenCtx<S>>) -> WindowClickHandler<ScreenCtx<S>> {
+        let ptr = self as *const ScreenCtx<S> as *mut ScreenCtx<S>;
+        self.window.set_click_handlers(ptr, callbacks)
+    }
+}
+
+// ── Public trait ───────────────────────────────────────────────────────────────
 
 pub trait ScreenFns {
-    type State;
+    type State: 'static;
     type Layers;
 
-    /// Called inside Pebble's load handler. Create all layers, add them to
-    /// the window's root layer, and return the `Layers` struct. The `handle`
-    /// pointer can be stored for use in click-handler context pointers.
-    fn create_window(window: &window::Window, handle: *mut ScreenHandle) -> Self::Layers;
+    /// Create all layers, add them to the window's root layer, and return the
+    /// `Layers` struct. Build layers with `taconite::layer::*` constructors,
+    /// passing `ctx` so they can read state at paint time.
+    fn create_window(ctx: &ScreenCtx<Self::State>) -> Self::Layers;
 
-    /// Pure description of the screen given the current state. Called
-    /// automatically after every `handle.update(...)` call.
+    /// Push current state into the layers. Called after every `ctx.update(...)`
+    /// that returns `true`, and once on load.
     fn view(state: &Self::State, layers: &Self::Layers);
 
     /// Called when an AppMessage arrives for this screen's window ID.
-    /// Mutate state by calling `handle.update(|s| { ... })`.
-    fn on_message(handle: &mut ScreenHandle, dict: &AppMessageDict);
+    fn on_message(ctx: &ScreenCtx<Self::State>, dict: &AppMessageDict);
 
-    fn on_create(_handle: &mut ScreenHandle) {}
-    /// Called after the window is fully loaded and rendered, once the phone signals
-    /// it is ready to receive messages (via `taconite_window_id: 0` sentinel). If
-    /// the phone is already ready when this screen is pushed, it fires immediately.
-    /// Use this for sending subscribe/init messages to the phone; use `on_create`
-    /// for one-time setup like timers and clock subscriptions.
-    fn on_messaging_initialized(_handle: &mut ScreenHandle) {}
-    fn on_appear(_handle: &mut ScreenHandle) {}
-    fn on_disappear(_handle: &mut ScreenHandle) {}
-    fn on_drop(_handle: &mut ScreenHandle) {}
-    fn configure_clicks(_win: &window::Window, _handle: *mut ScreenHandle) -> Option<WindowClickHandler<ScreenHandle>> { None }
+    fn on_create(_ctx: &ScreenCtx<Self::State>) {}
+    /// Called once the phone signals it is ready (via the `taconite_window_id: 0`
+    /// sentinel) — or immediately on load if the phone was already ready. Use it
+    /// for sending subscribe/init messages to the phone.
+    fn on_messaging_initialized(_ctx: &ScreenCtx<Self::State>) {}
+    fn on_appear(_ctx: &ScreenCtx<Self::State>) {}
+    fn on_disappear(_ctx: &ScreenCtx<Self::State>) {}
+    fn on_drop(_ctx: &ScreenCtx<Self::State>) {}
+    fn configure_clicks(_ctx: &ScreenCtx<Self::State>) -> Option<WindowClickHandler<ScreenCtx<Self::State>>> { None }
 }
 
-// ── ScreenHandle ─────────────────────────────────────────────────────────────
-
-pub struct ScreenHandle {
-    pub window_id:             u8,
-    pub(crate) state_ptr:      *mut (),
-    pub(crate) layers_ptr:     *mut (),
-    pub(crate) root_layer_ptr: *mut pebble::RawLayer,
-    pub(crate) window_ptr:     WindowPtr,
-    view_fn: fn(*const (), *const ()),
-}
-
-impl ScreenHandle {
-    pub fn state<S>(&self) -> &S {
-        unsafe { &*(self.state_ptr as *const S) }
-    }
-
-    pub fn layers<L>(&self) -> Option<&L> {
-        if self.layers_ptr.is_null() { None }
-        else { Some(unsafe { &*(self.layers_ptr as *const L) }) }
-    }
-
-    pub fn root_layer(&self) -> Layer {
-        Layer::from_raw(self.root_layer_ptr)
-    }
-
-    pub fn window(&self) -> window::Window {
-        window::Window::from_raw(self.window_ptr)
-    }
-
-    /// Mutate state with `f`, then automatically re-render.
-    pub fn update<S, F: FnOnce(&mut S) -> bool>(&mut self, f: F) {
-        let rerender = unsafe { f(&mut *(self.state_ptr as *mut S)) };
-        if rerender && !self.layers_ptr.is_null() {
-            (self.view_fn)(self.state_ptr as *const (), self.layers_ptr as *const ());
-        }
-    }
-}
-
-// ── Internal bundle stored in window user data ────────────────────────────────
+// ── Internal bundle stored in window user data (type-erased over the screen) ────
 
 struct ScreenBundle {
-    handle:                   ScreenHandle,
+    ctx_ptr:                  *mut (),   // Box<ScreenCtx<Sc::State>>
     window_id:                u8,
-    on_load:                  fn(&mut ScreenHandle, *mut ()),
-    on_message:               fn(&mut ScreenHandle, &AppMessageDict),
-    on_messaging_initialized: fn(&mut ScreenHandle),
-    on_appear:                fn(&mut ScreenHandle),
-    on_disappear:             fn(&mut ScreenHandle),
-    on_drop:                  fn(&mut ScreenHandle),
-    configure_clicks:         fn(&window::Window, *mut ScreenHandle) -> Option<WindowClickHandler<ScreenHandle>>,
-    click_handler:            Option<WindowClickHandler<ScreenHandle>>,
+    on_load:                  fn(*mut (), WindowPtr),
+    on_message:               fn(*mut (), &AppMessageDict),
+    on_messaging_initialized: fn(*mut ()),
+    on_appear:                fn(*mut ()),
+    on_disappear:             fn(*mut ()),
+    on_drop:                  fn(*mut ()),
+    configure_clicks:         fn(*mut ()),
 }
 
-// ── Router ────────────────────────────────────────────────────────────────────
+// ── Router ──────────────────────────────────────────────────────────────────────
 
 struct RouterEntry {
     window_id:  u8,
@@ -149,35 +171,35 @@ fn router_unregister(window_id: u8) {
     }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Public API ──────────────────────────────────────────────────────────────────
 
 /// Push a new screen onto the Pebble window stack with the given initial state.
-pub fn push_screen<S: ScreenFns>(initial_state: S::State, animate: bool) {
-    let state_ptr = Box::into_raw(Box::new(initial_state)) as *mut ();
+pub fn push_screen<Sc: ScreenFns>(initial_state: Sc::State, animate: bool) {
     let window_id = next_window_id();
-    let win = window::Window::new();
-    let root_layer_ptr = win.get_root_layer().get_internal();
+    let win  = window::Window::new();
+    let root = win.get_root_layer();
 
-    let handle = ScreenHandle {
+    let ctx = Box::new(ScreenCtx::<Sc::State> {
+        state:      Rc::new(ReCell::new(initial_state)),
         window_id,
-        state_ptr,
-        layers_ptr: core::ptr::null_mut(),
-        root_layer_ptr,
-        window_ptr: win.raw(),
-        view_fn: view_trampoline::<S>,
-    };
+        root,
+        window:     window::Window::from_raw(win.raw()),
+        layers_ptr: Cell::new(core::ptr::null()),
+        view_fn:    view_trampoline::<Sc>,
+        click:      ReCell::new(None),
+    });
+    let ctx_ptr = Box::into_raw(ctx) as *mut ();
 
     let bundle = Box::new(ScreenBundle {
-        handle,
+        ctx_ptr,
         window_id,
-        on_load:                  on_load_trampoline::<S>,
-        on_message:               on_message_trampoline::<S>,
-        on_messaging_initialized: on_messaging_initialized_trampoline::<S>,
-        on_appear:                on_appear_trampoline::<S>,
-        on_disappear:             on_disappear_trampoline::<S>,
-        on_drop:                  on_drop_trampoline::<S>,
-        configure_clicks:         configure_clicks_trampoline::<S>,
-        click_handler:            None,
+        on_load:                  on_load_trampoline::<Sc>,
+        on_message:               on_message_trampoline::<Sc>,
+        on_messaging_initialized: on_messaging_initialized_trampoline::<Sc>,
+        on_appear:                on_appear_trampoline::<Sc>,
+        on_disappear:             on_disappear_trampoline::<Sc>,
+        on_drop:                  on_drop_trampoline::<Sc>,
+        configure_clicks:         configure_clicks_trampoline::<Sc>,
     });
     let bundle_ptr = Box::into_raw(bundle);
 
@@ -210,7 +232,7 @@ pub extern "C" fn message_received(dict_ptr: DictPtr, _ctx: VoidPtr) {
             MESSAGING_INITIALIZED = true;
             for e in &mut *core::ptr::addr_of_mut!(ROUTER) {
                 let bundle = &mut *e.bundle_ptr;
-                (bundle.on_messaging_initialized)(&mut bundle.handle);
+                (bundle.on_messaging_initialized)(bundle.ctx_ptr);
             }
         }
         return;
@@ -220,7 +242,7 @@ pub extern "C" fn message_received(dict_ptr: DictPtr, _ctx: VoidPtr) {
         for e in &mut *core::ptr::addr_of_mut!(ROUTER) {
             if e.window_id == window_id {
                 let bundle = &mut *e.bundle_ptr;
-                (bundle.on_message)(&mut bundle.handle, &dict);
+                (bundle.on_message)(bundle.ctx_ptr, &dict);
                 return;
             }
         }
@@ -230,15 +252,8 @@ pub extern "C" fn message_received(dict_ptr: DictPtr, _ctx: VoidPtr) {
 /// Receive a paged list over AppMessage.
 ///
 /// Builds `vec` incrementally as chunks arrive. Returns `true` when the final
-/// item has been received (or when the list is empty). Callers should re-render
-/// only on `true`.
-///
-/// Typical usage inside `on_message`:
-/// ```ignore
-/// if taconite::handle_list_message(&mut state.items, dict, |d| MyItem::parse(d)) {
-///     // list is complete
-/// }
-/// ```
+/// item has been received (or when the list is empty) — return that value from
+/// your `ctx.update(...)` closure so the screen re-renders only once complete.
 pub fn handle_list_message<T>(
     vec: &mut alloc::vec::Vec<Option<T>>,
     dict: &AppMessageDict,
@@ -276,14 +291,13 @@ pub fn send_message(key_values: &[(u32, i32)]) {
     AppMessage::send();
 }
 
-// ── Non-generic Pebble window callbacks ───────────────────────────────────────
+// ── Non-generic Pebble window callbacks ──────────────────────────────────────────
 
 extern "C" fn pebble_ui_load(window_ptr: WindowPtr) {
     let win    = window::Window::from_raw(window_ptr);
     let bundle = unsafe { &mut *win.get_user_data::<ScreenBundle>() };
-    (bundle.on_load)(&mut bundle.handle, window_ptr as *mut ());
-    let handle_ptr: *mut ScreenHandle = &mut bundle.handle;
-    bundle.click_handler = (bundle.configure_clicks)(&win, handle_ptr);
+    (bundle.on_load)(bundle.ctx_ptr, window_ptr);
+    (bundle.configure_clicks)(bundle.ctx_ptr);
 }
 
 extern "C" fn pebble_ui_unload(window_ptr: WindowPtr) {
@@ -292,73 +306,75 @@ extern "C" fn pebble_ui_unload(window_ptr: WindowPtr) {
     let bundle     = unsafe { &mut *bundle_ptr };
 
     router_unregister(bundle.window_id);
-    (bundle.on_drop)(&mut bundle.handle);
+    (bundle.on_drop)(bundle.ctx_ptr);   // runs on_drop, frees layers + the ScreenCtx box
     unsafe { drop(Box::from_raw(bundle_ptr)); }
 }
 
 extern "C" fn pebble_ui_appear(window_ptr: WindowPtr) {
     let win    = window::Window::from_raw(window_ptr);
     let bundle = unsafe { &mut *win.get_user_data::<ScreenBundle>() };
-    (bundle.on_appear)(&mut bundle.handle);
+    (bundle.on_appear)(bundle.ctx_ptr);
 }
 
 extern "C" fn pebble_ui_disappear(window_ptr: WindowPtr) {
     let win    = window::Window::from_raw(window_ptr);
     let bundle = unsafe { &mut *win.get_user_data::<ScreenBundle>() };
-    (bundle.on_disappear)(&mut bundle.handle);
+    (bundle.on_disappear)(bundle.ctx_ptr);
 }
 
-// ── Type-erased trampolines ───────────────────────────────────────────────────
+// ── Type-erased trampolines (monomorphized per screen type) ──────────────────────
 
-fn view_trampoline<S: ScreenFns>(state_ptr: *const (), layers_ptr: *const ()) {
-    let state  = unsafe { &*(state_ptr  as *const S::State) };
-    let layers = unsafe { &*(layers_ptr as *const S::Layers) };
-    S::view(state, layers);
+fn ctx_ref<'a, Sc: ScreenFns>(ctx_ptr: *mut ()) -> &'a ScreenCtx<Sc::State> {
+    unsafe { &*(ctx_ptr as *const ScreenCtx<Sc::State>) }
 }
 
-fn on_load_trampoline<S: ScreenFns>(handle: &mut ScreenHandle, window_ptr: *mut ()) {
-    let win    = window::Window::from_raw(window_ptr as WindowPtr);
-    let layers = S::create_window(&win, handle);
-    handle.layers_ptr = Box::into_raw(Box::new(layers)) as *mut ();
-    S::on_create(handle);
-    // Initial render with default state
-    (handle.view_fn)(handle.state_ptr as *const (), handle.layers_ptr as *const ());
-    // If the phone is already ready, fire immediately; otherwise wait for the sentinel.
+fn view_trampoline<Sc: ScreenFns>(state: &Sc::State, layers_ptr: *const ()) {
+    let layers = unsafe { &*(layers_ptr as *const Sc::Layers) };
+    Sc::view(state, layers);
+}
+
+fn on_load_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), _window_ptr: WindowPtr) {
+    let ctx = ctx_ref::<Sc>(ctx_ptr);
+    let layers = Sc::create_window(ctx);
+    ctx.layers_ptr.set(Box::into_raw(Box::new(layers)) as *const ());
+    // initial render
+    Sc::view(&ctx.state.borrow(), unsafe { &*(ctx.layers_ptr.get() as *const Sc::Layers) });
+    Sc::on_create(ctx);
     if unsafe { *core::ptr::addr_of!(MESSAGING_INITIALIZED) } {
-        S::on_messaging_initialized(handle);
+        Sc::on_messaging_initialized(ctx);
     }
 }
 
-fn on_message_trampoline<S: ScreenFns>(handle: &mut ScreenHandle, dict: &AppMessageDict) {
-    S::on_message(handle, dict);
+fn on_message_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), dict: &AppMessageDict) {
+    Sc::on_message(ctx_ref::<Sc>(ctx_ptr), dict);
 }
 
-fn on_messaging_initialized_trampoline<S: ScreenFns>(handle: &mut ScreenHandle) {
-    S::on_messaging_initialized(handle);
+fn on_messaging_initialized_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
+    Sc::on_messaging_initialized(ctx_ref::<Sc>(ctx_ptr));
 }
 
-fn on_appear_trampoline<S: ScreenFns>(handle: &mut ScreenHandle) {
-    S::on_appear(handle);
+fn on_appear_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
+    Sc::on_appear(ctx_ref::<Sc>(ctx_ptr));
 }
 
-fn on_disappear_trampoline<S: ScreenFns>(handle: &mut ScreenHandle) {
-    S::on_disappear(handle);
+fn on_disappear_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
+    Sc::on_disappear(ctx_ref::<Sc>(ctx_ptr));
 }
 
-fn configure_clicks_trampoline<S: ScreenFns>(win: &window::Window, handle: *mut ScreenHandle) -> Option<WindowClickHandler<ScreenHandle>> {
-    S::configure_clicks(win, handle)
+fn configure_clicks_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
+    let ctx = ctx_ref::<Sc>(ctx_ptr);
+    let handler = Sc::configure_clicks(ctx);
+    *ctx.click.borrow_mut() = handler;
 }
 
-fn on_drop_trampoline<S: ScreenFns>(handle: &mut ScreenHandle) {
-    S::on_drop(handle);
-    unsafe {
-        if !handle.state_ptr.is_null() {
-            drop(Box::from_raw(handle.state_ptr as *mut S::State));
-            handle.state_ptr = core::ptr::null_mut();
-        }
-        if !handle.layers_ptr.is_null() {
-            drop(Box::from_raw(handle.layers_ptr as *mut S::Layers));
-            handle.layers_ptr = core::ptr::null_mut();
-        }
+fn on_drop_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
+    let ctx = ctx_ref::<Sc>(ctx_ptr);
+    Sc::on_drop(ctx);
+    let lp = ctx.layers_ptr.get();
+    if !lp.is_null() {
+        unsafe { drop(Box::from_raw(lp as *mut Sc::Layers)); }
+        ctx.layers_ptr.set(core::ptr::null());
     }
+    // free the ScreenCtx box itself (drops state Rc + click handler)
+    unsafe { drop(Box::from_raw(ctx_ptr as *mut ScreenCtx<Sc::State>)); }
 }

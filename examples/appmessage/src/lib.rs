@@ -9,10 +9,11 @@ extern crate taconite;
 
 use pebble::app;
 use pebble::app_message::{AppMessage, AppMessageDict};
-use pebble::layer::{ILayer, TextLayer};
+use pebble::layer::ILayer;
 use pebble::std::ToCString;
 use pebble::types::{GPoint, GRect, GSize};
-use taconite::{ScreenFns, ScreenHandle};
+use taconite::layer::Text;
+use taconite::{ScreenCtx, ScreenFns};
 
 const MESSAGE_KEY_EXAMPLE: u32 = 1768777472;
 
@@ -24,39 +25,41 @@ pub struct AppMessageState {
     text: alloc::ffi::CString,
 }
 
-
 pub struct AppMessageLayers {
-    text_layer: TextLayer,
+    text_layer: Text,
 }
 
 impl ScreenFns for AppMessageScreen {
     type State = AppMessageState;
     type Layers = AppMessageLayers;
 
-    fn create_window(window: &pebble::window::Window, _handle: *mut ScreenHandle) -> Self::Layers {
-        let root = window.get_root_layer();
-        let bounds = root.get_bounds();
-        let text_layer = TextLayer::new(GRect {
-            origin: GPoint { x: bounds.size.w / 9, y: bounds.size.h / 2 - 20 },
-            size: GSize { w: bounds.size.w, h: 20 },
-        });
-        root.add_child(&text_layer);
+    fn create_window(ctx: &ScreenCtx<AppMessageState>) -> Self::Layers {
+        let bounds = ctx.root().get_bounds();
+        let text_layer = Text::new(
+            GRect {
+                origin: GPoint { x: bounds.size.w / 9, y: bounds.size.h / 2 - 20 },
+                size: GSize { w: bounds.size.w, h: 20 },
+            },
+            ctx,
+            |s| s.text.as_c_str(),
+        );
+        ctx.root().add_child(&text_layer);
         AppMessageLayers { text_layer }
     }
 
-    fn view(state: &Self::State, layers: &Self::Layers) {
-        layers.text_layer.set_text(&state.text);
+    fn view(_state: &Self::State, layers: &Self::Layers) {
+        layers.text_layer.render();
     }
 
-    fn on_messaging_initialized(handle: &mut ScreenHandle) {
+    fn on_messaging_initialized(ctx: &ScreenCtx<AppMessageState>) {
         // Send our window ID to the phone so it knows where to route replies.
-        taconite::send_message(&[(taconite::TaconiteMessageKey::WindowId as u32, handle.window_id as i32)]);
+        taconite::send_message(&[(taconite::TaconiteMessageKey::WindowId as u32, ctx.window_id as i32)]);
     }
 
-    fn on_message(handle: &mut ScreenHandle, dict: &AppMessageDict) {
+    fn on_message(ctx: &ScreenCtx<AppMessageState>, dict: &AppMessageDict) {
         if let Some(text) = dict.find_str(MESSAGE_KEY_EXAMPLE) {
             let cstring = text.to_cstring();
-            handle.update(|s: &mut AppMessageState| {
+            ctx.update(|s| {
                 s.text = cstring;
                 true
             });
