@@ -1,5 +1,6 @@
 #![no_std]
 #![no_builtins]
+#![feature(associated_type_defaults)]
 
 extern crate alloc;
 extern crate pebble_rust as pebble;
@@ -18,6 +19,7 @@ pub mod layer;
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::cell::Cell;
+use core::ops::Deref;
 use cell::ReCell;
 
 use pebble::{window, WindowPtr};
@@ -39,9 +41,16 @@ pub type Shared<S> = Rc<ReCell<S>>;
 /// A phone-side message with `WindowId = 0` is the phone-ready sentinel that
 /// triggers `on_messaging_initialized` on all active screens.
 pub enum TaconiteMessageKey {
-    WindowId  = 0x5441_434F,
-    ItemIndex = 0x5441_4350,
-    ItemTotal = 0x5441_4351,
+    WindowId = 0x5441_434F,
+    WindowType = 0x5441_4350,
+    ItemIndex = 0x5441_4351,
+    ItemTotal = 0x5441_4352,
+    SubscriptionEvent = 0x5441_4353,
+}
+
+pub enum SubscriptionEvent {
+    Subscribe = 0,
+    Unsubscribe = 1,
 }
 
 // ── ScreenCtx — typed, handed to every screen method ───────────────────────────
@@ -77,17 +86,18 @@ impl<S> ScreenCtx<S> {
         if lp.is_null() { None } else { Some(unsafe { &*(lp as *const L) }) }
     }
 
-    /// Mutate the state with `f`; if `f` returns `true`, re-render via `view`.
-    /// The `bool` gates re-render so a screen doesn't flicker through partially
-    /// assembled state (e.g. a list arriving over several AppMessages).
-    pub fn update(&self, f: impl FnOnce(&mut S) -> bool) {
-        let rerender = f(&mut self.state.borrow_mut());   // borrow_mut dropped at the `;`
-        if rerender {
-            let lp = self.layers_ptr.get();
-            if !lp.is_null() {
-                (self.view_fn)(&self.state.borrow(), lp);  // safe to borrow() now
-            }
+    /// Mutate the state with `f` and re-render. Returns `f`'s value.
+    ///
+    /// (Data arriving over several AppMessages should accumulate via
+    /// `ScreenMessageCtx::update_temp` and land in one `commit`, so the rendered
+    /// state is never caught half-assembled — see `ScreenMessageCtx`.)
+    pub fn update<R>(&self, f: impl FnOnce(&mut S) -> R) -> R {
+        let r = f(&mut self.state.borrow_mut());   // borrow_mut dropped at the `;`
+        let lp = self.layers_ptr.get();
+        if !lp.is_null() {
+            (self.view_fn)(&self.state.borrow(), lp);  // safe to borrow() now
         }
+        r
     }
 
     /// Wire up click handlers for this screen. Call from `configure_clicks`.
@@ -98,10 +108,52 @@ impl<S> ScreenCtx<S> {
     }
 }
 
+// ── ScreenMessageCtx — handed to on_message only ───────────────────────────────
+
+/// The context `on_message` receives. Derefs to `ScreenCtx<S>` for all the usual
+/// reads/updates, and adds a staging buffer (`TempState`) that nothing draws from,
+/// so data arriving over several AppMessages is assembled off-screen and applied in
+/// one atomic `commit` — the rendered `State` is never caught half-built.
+pub struct ScreenMessageCtx<'a, S, T> {
+    ctx:  &'a ScreenCtx<S>,
+    temp: &'a ReCell<T>,
+}
+
+impl<S, T> Deref for ScreenMessageCtx<'_, S, T> {
+    type Target = ScreenCtx<S>;
+    fn deref(&self) -> &ScreenCtx<S> { self.ctx }
+}
+
+impl<S, T: Default> ScreenMessageCtx<'_, S, T> {
+    /// Accumulate into the off-screen staging buffer. Never re-renders (nothing
+    /// draws from `TempState`). Returns `f`'s value — e.g. the completeness `bool`
+    /// from `handle_list_message`, so you can decide when to `commit`.
+    pub fn update_temp<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        f(&mut self.temp.borrow_mut())
+    }
+
+    /// Atomically fold the staging buffer into the rendered `State`, then re-render
+    /// once. `f` gets `&mut T` so you can `mem::take` / `Option::take` buffers
+    /// straight into `State` (no clone). The buffer is reset to `T::default()`
+    /// afterwards. Returns `f`'s value.
+    pub fn commit<R>(&self, f: impl FnOnce(&mut S, &mut T) -> R) -> R {
+        let r = f(&mut self.ctx.state.borrow_mut(), &mut self.temp.borrow_mut()); // both borrows dropped at `;`
+        *self.temp.borrow_mut() = T::default();
+        let lp = self.ctx.layers_ptr.get();
+        if !lp.is_null() {
+            (self.ctx.view_fn)(&self.ctx.state.borrow(), lp);
+        }
+        r
+    }
+}
+
 // ── Public trait ───────────────────────────────────────────────────────────────
 
 pub trait ScreenFns {
     type State: 'static;
+    /// Off-screen staging buffer for multi-message loads (default `()` — opt in only
+    /// when a screen assembles data over several AppMessages). See `ScreenMessageCtx`.
+    type TempState: Default + 'static = ();
     type Layers;
 
     /// Create all layers, add them to the window's root layer, and return the
@@ -113,8 +165,9 @@ pub trait ScreenFns {
     /// that returns `true`, and once on load.
     fn view(state: &Self::State, layers: &Self::Layers);
 
-    /// Called when an AppMessage arrives for this screen's window ID.
-    fn on_message(ctx: &ScreenCtx<Self::State>, dict: &AppMessageDict);
+    /// Called when an AppMessage arrives for this screen's window ID. The context
+    /// derefs to `ScreenCtx` and adds `update_temp` / `commit` for staged loads.
+    fn on_message(ctx: &ScreenMessageCtx<Self::State, Self::TempState>, dict: &AppMessageDict);
 
     fn on_create(_ctx: &ScreenCtx<Self::State>) {}
     /// Called once the phone signals it is ready (via the `taconite_window_id: 0`
@@ -131,13 +184,14 @@ pub trait ScreenFns {
 
 struct ScreenBundle {
     ctx_ptr:                  *mut (),   // Box<ScreenCtx<Sc::State>>
+    temp_ptr:                 *mut (),   // Box<ReCell<Sc::TempState>>
     window_id:                u8,
     on_load:                  fn(*mut (), WindowPtr),
-    on_message:               fn(*mut (), &AppMessageDict),
+    on_message:               fn(*mut (), *mut (), &AppMessageDict),
     on_messaging_initialized: fn(*mut ()),
     on_appear:                fn(*mut ()),
     on_disappear:             fn(*mut ()),
-    on_drop:                  fn(*mut ()),
+    on_drop:                  fn(*mut (), *mut ()),
     configure_clicks:         fn(*mut ()),
 }
 
@@ -190,8 +244,11 @@ pub fn push_screen<Sc: ScreenFns>(initial_state: Sc::State, animate: bool) {
     });
     let ctx_ptr = Box::into_raw(ctx) as *mut ();
 
+    let temp_ptr = Box::into_raw(Box::new(ReCell::new(Sc::TempState::default()))) as *mut ();
+
     let bundle = Box::new(ScreenBundle {
         ctx_ptr,
+        temp_ptr,
         window_id,
         on_load:                  on_load_trampoline::<Sc>,
         on_message:               on_message_trampoline::<Sc>,
@@ -242,7 +299,7 @@ pub extern "C" fn message_received(dict_ptr: DictPtr, _ctx: VoidPtr) {
         for e in &mut *core::ptr::addr_of_mut!(ROUTER) {
             if e.window_id == window_id {
                 let bundle = &mut *e.bundle_ptr;
-                (bundle.on_message)(bundle.ctx_ptr, &dict);
+                (bundle.on_message)(bundle.ctx_ptr, bundle.temp_ptr, &dict);
                 return;
             }
         }
@@ -278,7 +335,7 @@ pub fn handle_list_message<T>(
         *slot = Some(item);
     }
 
-    index + 1 >= total
+    vec.iter().all(|o| o.is_some())
 }
 
 /// Send a small AppMessage from watch to phone (key-value pairs of i32).
@@ -306,7 +363,7 @@ extern "C" fn pebble_ui_unload(window_ptr: WindowPtr) {
     let bundle     = unsafe { &mut *bundle_ptr };
 
     router_unregister(bundle.window_id);
-    (bundle.on_drop)(bundle.ctx_ptr);   // runs on_drop, frees layers + the ScreenCtx box
+    (bundle.on_drop)(bundle.ctx_ptr, bundle.temp_ptr);   // on_drop, frees layers + ctx + temp boxes
     unsafe { drop(Box::from_raw(bundle_ptr)); }
 }
 
@@ -345,8 +402,11 @@ fn on_load_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), _window_ptr: WindowPtr) {
     }
 }
 
-fn on_message_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), dict: &AppMessageDict) {
-    Sc::on_message(ctx_ref::<Sc>(ctx_ptr), dict);
+fn on_message_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), temp_ptr: *mut (), dict: &AppMessageDict) {
+    let ctx  = ctx_ref::<Sc>(ctx_ptr);
+    let temp = unsafe { &*(temp_ptr as *const ReCell<Sc::TempState>) };
+    let mctx = ScreenMessageCtx { ctx, temp };
+    Sc::on_message(&mctx, dict);
 }
 
 fn on_messaging_initialized_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
@@ -367,7 +427,7 @@ fn configure_clicks_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
     *ctx.click.borrow_mut() = handler;
 }
 
-fn on_drop_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
+fn on_drop_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), temp_ptr: *mut ()) {
     let ctx = ctx_ref::<Sc>(ctx_ptr);
     Sc::on_drop(ctx);
     let lp = ctx.layers_ptr.get();
@@ -375,6 +435,7 @@ fn on_drop_trampoline<Sc: ScreenFns>(ctx_ptr: *mut ()) {
         unsafe { drop(Box::from_raw(lp as *mut Sc::Layers)); }
         ctx.layers_ptr.set(core::ptr::null());
     }
-    // free the ScreenCtx box itself (drops state Rc + click handler)
+    // free the ScreenCtx box (drops state Rc + click handler) and the TempState box
     unsafe { drop(Box::from_raw(ctx_ptr as *mut ScreenCtx<Sc::State>)); }
+    unsafe { drop(Box::from_raw(temp_ptr as *mut ReCell<Sc::TempState>)); }
 }

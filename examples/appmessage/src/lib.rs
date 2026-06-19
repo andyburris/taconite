@@ -13,7 +13,7 @@ use pebble::layer::ILayer;
 use pebble::std::ToCString;
 use pebble::types::{GPoint, GRect, GSize};
 use taconite::layer::Text;
-use taconite::{ScreenCtx, ScreenFns};
+use taconite::{ScreenCtx, ScreenFns, ScreenMessageCtx};
 
 const MESSAGE_KEY_EXAMPLE: u32 = 1768777472;
 
@@ -53,15 +53,17 @@ impl ScreenFns for AppMessageScreen {
 
     fn on_messaging_initialized(ctx: &ScreenCtx<AppMessageState>) {
         // Send our window ID to the phone so it knows where to route replies.
-        taconite::send_message(&[(taconite::TaconiteMessageKey::WindowId as u32, ctx.window_id as i32)]);
+        taconite::send_message(&[
+            (taconite::TaconiteMessageKey::WindowId as u32, ctx.window_id as i32), 
+            (taconite::TaconiteMessageKey::WindowType as u32, 0 as i32)
+        ]);
     }
 
-    fn on_message(ctx: &ScreenCtx<AppMessageState>, dict: &AppMessageDict) {
+    fn on_message(ctx: &ScreenMessageCtx<AppMessageState, ()>, dict: &AppMessageDict) {
         if let Some(text) = dict.find_str(MESSAGE_KEY_EXAMPLE) {
             let cstring = text.to_cstring();
             ctx.update(|s| {
                 s.text = cstring;
-                true
             });
         }
     }

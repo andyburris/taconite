@@ -19,10 +19,13 @@
     "projectType": "native",
     "uuid": "19a34205-309a-47fc-8833-30fd68f685f7",
     "messageKeys": {
-      "taconite_window_id": 1413563215,
-      "ItemIndex": 1413563216,
-      "ItemTotal": 1413563217,
-      "App_ExampleKey": 1768777472
+      "App_ExampleKey": 1768777472,
+
+      "taconite_WindowId": 1413563215,
+      "taconite_WindowType": 1413563216,
+      "taconite_ItemIndex": 1413563217,
+      "taconite_ItemTotal": 1413563218,
+      "taconite_SubscriptionEvent": 1413563219
     },
     "enableMultiJS": false,
     "displayName": "Taconite (AppMessage)",
