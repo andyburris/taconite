@@ -57,10 +57,11 @@ def build(ctx):
         # the ARM EHABI exception-table boundaries since Pebble has no exceptions.
         ctx.env.LINKFLAGS.append('-Wl,--defsym=__exidx_start=0')
         ctx.env.LINKFLAGS.append('-Wl,--defsym=__exidx_end=0')
-        ctx.env.LINKFLAGS += glob.glob('../target/thumbv7m-none-eabi/release/deps/*.o')
+        ctx.env.LINKFLAGS.append('-Wl,-z,noexecstack')
+        ctx.env.LINKFLAGS += glob.glob('../target/thumbv7m-none-eabi/release/link-objs/*.o')
         os.chdir('..')
-        
-        ctx.pbl_program(source=ctx.path.ant_glob('target/thumbv7m-none-eabi/release/deps/*.o') + pebble_rust_c,
+
+        ctx.pbl_program(source=ctx.path.ant_glob('target/thumbv7m-none-eabi/release/link-objs/*.o') + pebble_rust_c,
         target=app_elf)
 
         if build_worker:

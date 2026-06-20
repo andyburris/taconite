@@ -1,2 +1,9 @@
 [build]
 target = "thumbv7m-none-eabi"
+
+[unstable]
+# Recompile std so panic=immediate-abort applies all the way down (the prebuilt
+# sysroot still carries the fmt/panic paths). No compiler-builtins-mem: leaving it
+# off means compiler_builtins emits no mem symbols, so pebble-rust's tiny
+# mem*/__aeabi_* defs are the only ones.
+build-std = ["core", "alloc", "compiler_builtins"]
