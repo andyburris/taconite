@@ -16,9 +16,9 @@ use alloc::ffi::CString;
 use alloc::rc::Rc;
 use core::ffi::CStr;
 
-use pebble::layer::{ILayer, TextLayer, TypedMenuCallbacks};
-use pebble::system::fonts::Font;
-use pebble::types::{GColor, GRect, GTextAlignment, MenuIndex};
+use pebble::layer::{AsLayer, MenuCellLayer, MenuLayerRef, TextLayer, TypedMenuCallbacks};
+use pebble::system::fonts::GFont;
+use pebble::types::{GColor, GRect, GTextAlignment, MenuIndex, MenuRowAlign};
 use pebble::window::Window;
 use pebble::{GContext, RawLayer};
 
@@ -64,9 +64,9 @@ impl Draw {
     }
 }
 
-impl ILayer for Draw {
-    fn get_internal(&self) -> *mut RawLayer {
-        self.inner.get_internal()
+impl AsLayer for Draw {
+    fn as_raw(&self) -> *mut RawLayer {
+        self.inner.as_raw()
     }
 }
 
@@ -141,15 +141,15 @@ impl Text {
         self.inner.set_text(self.text.borrow().as_c_str());
     }
 
-    pub fn set_font(&self, font: Font) { self.inner.set_font(font); }
+    pub fn set_font(&self, font: GFont) { self.inner.set_font(font); }
     pub fn set_text_color(&self, color: GColor) { self.inner.set_text_color(color); }
     pub fn set_background_color(&self, color: GColor) { self.inner.set_background_color(color); }
     pub fn set_text_alignment(&self, alignment: GTextAlignment) { self.inner.set_text_alignment(alignment); }
 }
 
-impl ILayer for Text {
-    fn get_internal(&self) -> *mut RawLayer {
-        self.inner.get_internal()
+impl AsLayer for Text {
+    fn as_raw(&self) -> *mut RawLayer {
+        self.inner.as_raw()
     }
 }
 
@@ -162,13 +162,13 @@ impl ILayer for Text {
 /// shared `Rc<build>` when this menu is one child of a composing custom layer.
 /// Wrap each at the call site: `Some(Box::new(|s, section| …))`.
 pub struct MenuCallbacks<S> {
-    pub get_num_sections:  Option<Box<dyn Fn(&S) -> u16>>,
-    pub get_num_rows:      Option<Box<dyn Fn(&S, u16) -> u16>>,
-    pub get_cell_height:   Option<Box<dyn Fn(&S, &MenuIndex) -> i16>>,
-    pub get_header_height: Option<Box<dyn Fn(&S, u16) -> i16>>,
-    pub draw_row:          Option<Box<dyn Fn(*mut GContext, *const RawLayer, &MenuIndex, &S)>>,
-    pub draw_header:       Option<Box<dyn Fn(*mut GContext, *const RawLayer, u16, &S)>>,
-    pub select_click:      Option<Box<dyn Fn(&S, &MenuIndex)>>,
+    pub get_num_sections:  Option<Box<dyn Fn(MenuLayerRef, &S) -> u16>>,
+    pub get_num_rows:      Option<Box<dyn Fn(MenuLayerRef, &S, u16) -> u16>>,
+    pub get_cell_height:   Option<Box<dyn Fn(MenuLayerRef, &S, &MenuIndex) -> i16>>,
+    pub get_header_height: Option<Box<dyn Fn(MenuLayerRef, &S, u16) -> i16>>,
+    pub draw_row:          Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &S)>>,
+    pub draw_header:       Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, u16, &S)>>,
+    pub select_click:      Option<Box<dyn Fn(MenuLayerRef, &S, &MenuIndex)>>,
 }
 
 impl<S> Default for MenuCallbacks<S> {
@@ -199,13 +199,13 @@ impl<S: 'static> Menu<S> {
     pub fn new(frame: GRect, ctx: &ScreenCtx<S>, cbs: MenuCallbacks<S>) -> Self {
         let mut mc = Box::new(MenuCtx { shared: ctx.shared(), cbs });
         let typed = TypedMenuCallbacks::<MenuCtx<S>> {
-            get_num_sections:  mc.cbs.get_num_sections .as_ref().map(|_| t_num_sections::<S>  as fn(&MenuCtx<S>) -> u16),
-            get_num_rows:      mc.cbs.get_num_rows     .as_ref().map(|_| t_num_rows::<S>      as fn(&MenuCtx<S>, u16) -> u16),
-            get_cell_height:   mc.cbs.get_cell_height  .as_ref().map(|_| t_cell_height::<S>   as fn(&MenuCtx<S>, &MenuIndex) -> i16),
-            get_header_height: mc.cbs.get_header_height.as_ref().map(|_| t_header_height::<S> as fn(&MenuCtx<S>, u16) -> i16),
-            draw_row:          mc.cbs.draw_row         .as_ref().map(|_| t_draw_row::<S>      as fn(*mut GContext, *const RawLayer, &MenuIndex, &MenuCtx<S>)),
-            draw_header:       mc.cbs.draw_header      .as_ref().map(|_| t_draw_header::<S>   as fn(*mut GContext, *const RawLayer, u16, &MenuCtx<S>)),
-            select_click:      mc.cbs.select_click     .as_ref().map(|_| t_select_click::<S>  as fn(&MenuCtx<S>, &MenuIndex)),
+            get_num_sections:  mc.cbs.get_num_sections .as_ref().map(|_| t_num_sections::<S>  as fn(MenuLayerRef, &MenuCtx<S>) -> u16),
+            get_num_rows:      mc.cbs.get_num_rows     .as_ref().map(|_| t_num_rows::<S>      as fn(MenuLayerRef, &MenuCtx<S>, u16) -> u16),
+            get_cell_height:   mc.cbs.get_cell_height  .as_ref().map(|_| t_cell_height::<S>   as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex) -> i16),
+            get_header_height: mc.cbs.get_header_height.as_ref().map(|_| t_header_height::<S> as fn(MenuLayerRef, &MenuCtx<S>, u16) -> i16),
+            draw_row:          mc.cbs.draw_row         .as_ref().map(|_| t_draw_row::<S>      as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &MenuCtx<S>)),
+            draw_header:       mc.cbs.draw_header      .as_ref().map(|_| t_draw_header::<S>   as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, u16, &MenuCtx<S>)),
+            select_click:      mc.cbs.select_click     .as_ref().map(|_| t_select_click::<S>  as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex)),
             ..TypedMenuCallbacks::default()
         };
         let ptr: *mut MenuCtx<S> = &mut *mc;
@@ -224,33 +224,43 @@ impl<S: 'static> Menu<S> {
         self.inner.set_normal_colors(background, foreground);
     }
 
-
+    pub fn get_selected_index(&self) -> MenuIndex { self.inner.get_selected_index() }
+    pub fn is_index_selected(&self, index: &MenuIndex) -> bool { self.inner.is_index_selected(index) }
+    pub fn get_center_focused(&self) -> bool { self.inner.get_center_focused() }
+    pub fn set_center_focused(&self, center_focused: bool) { self.inner.set_center_focused(center_focused); }
+    pub fn set_selected_index(&self, index: MenuIndex, scroll_align: MenuRowAlign, animated: bool) {
+        self.inner.set_selected_index(index, scroll_align, animated);
+    }
+    pub fn set_selected_next(&self, up: bool, scroll_align: MenuRowAlign, animated: bool) {
+        self.inner.set_selected_next(up, scroll_align, animated);
+    }
+    pub fn pad_bottom_enable(&self, enable: bool) { self.inner.pad_bottom_enable(enable); }
 }
 
-impl<S: 'static> ILayer for Menu<S> {
-    fn get_internal(&self) -> *mut RawLayer {
-        self.inner.get_internal()
+impl<S: 'static> AsLayer for Menu<S> {
+    fn as_raw(&self) -> *mut RawLayer {
+        self.inner.as_raw()
     }
 }
 
-fn t_num_sections<S>(mc: &MenuCtx<S>) -> u16 {
-    (mc.cbs.get_num_sections.as_ref().unwrap())(&mc.shared.borrow())
+fn t_num_sections<S>(menu: MenuLayerRef, mc: &MenuCtx<S>) -> u16 {
+    (mc.cbs.get_num_sections.as_ref().unwrap())(menu, &mc.shared.borrow())
 }
-fn t_num_rows<S>(mc: &MenuCtx<S>, section: u16) -> u16 {
-    (mc.cbs.get_num_rows.as_ref().unwrap())(&mc.shared.borrow(), section)
+fn t_num_rows<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, section: u16) -> u16 {
+    (mc.cbs.get_num_rows.as_ref().unwrap())(menu, &mc.shared.borrow(), section)
 }
-fn t_cell_height<S>(mc: &MenuCtx<S>, idx: &MenuIndex) -> i16 {
-    (mc.cbs.get_cell_height.as_ref().unwrap())(&mc.shared.borrow(), idx)
+fn t_cell_height<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) -> i16 {
+    (mc.cbs.get_cell_height.as_ref().unwrap())(menu, &mc.shared.borrow(), idx)
 }
-fn t_header_height<S>(mc: &MenuCtx<S>, section: u16) -> i16 {
-    (mc.cbs.get_header_height.as_ref().unwrap())(&mc.shared.borrow(), section)
+fn t_header_height<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, section: u16) -> i16 {
+    (mc.cbs.get_header_height.as_ref().unwrap())(menu, &mc.shared.borrow(), section)
 }
-fn t_draw_row<S>(g: *mut GContext, cell: *const RawLayer, idx: &MenuIndex, mc: &MenuCtx<S>) {
-    (mc.cbs.draw_row.as_ref().unwrap())(g, cell, idx, &mc.shared.borrow())
+fn t_draw_row<S>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, idx: &MenuIndex, mc: &MenuCtx<S>) {
+    (mc.cbs.draw_row.as_ref().unwrap())(menu, g, cell, idx, &mc.shared.borrow())
 }
-fn t_draw_header<S>(g: *mut GContext, cell: *const RawLayer, section: u16, mc: &MenuCtx<S>) {
-    (mc.cbs.draw_header.as_ref().unwrap())(g, cell, section, &mc.shared.borrow())
+fn t_draw_header<S>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, section: u16, mc: &MenuCtx<S>) {
+    (mc.cbs.draw_header.as_ref().unwrap())(menu, g, cell, section, &mc.shared.borrow())
 }
-fn t_select_click<S>(mc: &MenuCtx<S>, idx: &MenuIndex) {
-    (mc.cbs.select_click.as_ref().unwrap())(&mc.shared.borrow(), idx)
+fn t_select_click<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) {
+    (mc.cbs.select_click.as_ref().unwrap())(menu, &mc.shared.borrow(), idx)
 }

@@ -9,7 +9,7 @@ extern crate taconite;
 
 use pebble::app;
 use pebble::app_message::{AppMessage, AppMessageDict};
-use pebble::layer::ILayer;
+use pebble::layer::AsLayer;
 use pebble::std::ToCString;
 use pebble::types::{GPoint, GRect, GSize};
 use taconite::layer::Text;
