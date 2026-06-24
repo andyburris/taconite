@@ -22,8 +22,9 @@ use pebble::types::{GColor, GRect, GTextAlignment, MenuIndex, MenuRowAlign};
 use pebble::window::Window;
 use pebble::{GContext, RawLayer};
 
-use crate::cell::ReCell;
-use crate::{ScreenCtx, Shared};
+use core::cell::RefCell;
+
+use crate::State;
 
 // ── Draw — the safe primitive (reference model) ──────────────────────────────────
 
@@ -42,14 +43,14 @@ pub struct Draw {
 impl Draw {
     pub fn new<S: 'static>(
         bounds: GRect,
-        ctx: &ScreenCtx<S>,
+        state: &State<S>,
         draw: impl Fn(&mut GContext, &S, GRect) + 'static,
     ) -> Self {
-        let shared: Shared<S> = ctx.shared();
-        // Erase S: the painter captures Shared<S> + the user closure and borrows
-        // the state at paint time.
+        let state = state.clone();
+        // Erase S: the painter captures the State handle + the user closure and
+        // reads the state at paint time.
         let painter: Painter = Box::new(move |canvas, frame| {
-            draw(canvas, &shared.borrow(), frame);
+            draw(canvas, &state.read(), frame);
         });
         // The painter lives on the heap; moving the Box into the struct keeps its
         // address, so the pointer handed to pebble's DrawLayer stays valid.
@@ -76,21 +77,21 @@ impl AsLayer for Draw {
 /// C layer points at; the author supplies a selector that borrows from state.
 pub struct Text {
     inner:  TextLayer,
-    text:   ReCell<CString>,
+    text:   RefCell<CString>,
     select: Box<dyn Fn() -> CString>,
 }
 
 impl Text {
     pub fn new<S: 'static>(
         bounds: GRect,
-        ctx: &ScreenCtx<S>,
+        state: &State<S>,
         f: impl Fn(&S) -> &CStr + 'static,
     ) -> Self {
-        let shared: Shared<S> = ctx.shared();
-        let select: Box<dyn Fn() -> CString> = Box::new(move || f(&shared.borrow()).to_owned());
+        let state = state.clone();
+        let select: Box<dyn Fn() -> CString> = Box::new(move || f(&state.read()).to_owned());
         let me = Text {
             inner:  TextLayer::new(bounds),
-            text:   ReCell::new(c"".to_owned()),
+            text:   RefCell::new(c"".to_owned()),
             select,
         };
         me.render();
@@ -102,14 +103,14 @@ impl Text {
     /// an existing field. The lower-level primitive behind `from_build`.
     pub fn computed<S: 'static>(
         bounds: GRect,
-        ctx: &ScreenCtx<S>,
+        state: &State<S>,
         f: impl Fn(&S) -> CString + 'static,
     ) -> Self {
-        let shared: Shared<S> = ctx.shared();
-        let select: Box<dyn Fn() -> CString> = Box::new(move || f(&shared.borrow()));
+        let state = state.clone();
+        let select: Box<dyn Fn() -> CString> = Box::new(move || f(&state.read()));
         let me = Text {
             inner:  TextLayer::new(bounds),
-            text:   ReCell::new(c"".to_owned()),
+            text:   RefCell::new(c"".to_owned()),
             select,
         };
         me.render();
@@ -125,11 +126,11 @@ impl Text {
     /// eventual `custom_layer!` macro is intended to generate this wiring.
     pub fn from_build<S: 'static, D: 'static>(
         bounds: GRect,
-        ctx: &ScreenCtx<S>,
+        state: &State<S>,
         build: Rc<dyn Fn(&S, &mut dyn FnMut(&D))>,
         extract: impl Fn(&D) -> CString + 'static,
     ) -> Self {
-        Text::computed(bounds, ctx, move |s| {
+        Text::computed(bounds, state, move |s| {
             let mut out = c"".to_owned();
             build(s, &mut |d| out = extract(d));
             out
@@ -155,39 +156,60 @@ impl AsLayer for Text {
 
 // ── Menu — generic over the screen state ─────────────────────────────────────────
 
-/// Reactive menu callbacks. Each receives `&S` (the live screen state) instead of
-/// a raw context. Mirrors the subset of pebble's menu callbacks most apps use.
+/// Reactive menu callbacks, mirroring pebble's full menu callback set.
+///
+/// Read-only callbacks (layout/paint) receive `&S`, the live screen state
+/// borrowed for the call. Writable callbacks (user input) receive `&State<S>`, so
+/// they can `state.update(..)` and repaint sibling layers. Every callback also
+/// gets a `MenuLayerRef` to query the menu itself (selected index, etc.).
 ///
 /// Callbacks are boxed closures (not `fn` pointers) so they can capture — e.g. a
 /// shared `Rc<build>` when this menu is one child of a composing custom layer.
-/// Wrap each at the call site: `Some(Box::new(|s, section| …))`.
+/// Wrap each at the call site: `Some(Box::new(|menu, s, section| …))`.
 pub struct MenuCallbacks<S> {
-    pub get_num_sections:  Option<Box<dyn Fn(MenuLayerRef, &S) -> u16>>,
-    pub get_num_rows:      Option<Box<dyn Fn(MenuLayerRef, &S, u16) -> u16>>,
-    pub get_cell_height:   Option<Box<dyn Fn(MenuLayerRef, &S, &MenuIndex) -> i16>>,
-    pub get_header_height: Option<Box<dyn Fn(MenuLayerRef, &S, u16) -> i16>>,
-    pub draw_row:          Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &S)>>,
-    pub draw_header:       Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, u16, &S)>>,
-    pub select_click:      Option<Box<dyn Fn(MenuLayerRef, &S, &MenuIndex)>>,
+    // ── read-only (layout / paint): borrowed `&S` ──
+    pub get_num_sections:      Option<Box<dyn Fn(MenuLayerRef, &S) -> u16>>,
+    pub get_num_rows:          Option<Box<dyn Fn(MenuLayerRef, &S, u16) -> u16>>,
+    pub get_cell_height:       Option<Box<dyn Fn(MenuLayerRef, &S, &MenuIndex) -> i16>>,
+    pub get_header_height:     Option<Box<dyn Fn(MenuLayerRef, &S, u16) -> i16>>,
+    pub get_separator_height:  Option<Box<dyn Fn(MenuLayerRef, &S, &MenuIndex) -> i16>>,
+    pub draw_row:              Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &S)>>,
+    pub draw_header:           Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, u16, &S)>>,
+    pub draw_separator:        Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &S)>>,
+    pub draw_background:       Option<Box<dyn Fn(MenuLayerRef, &mut GContext, &MenuCellLayer, bool, &S)>>,
+    /// Fires just before the selection moves; mutate the `&mut MenuIndex` (the
+    /// *next* index) to redirect it. Read-only on state.
+    pub selection_will_change: Option<Box<dyn Fn(MenuLayerRef, &S, &mut MenuIndex, MenuIndex)>>,
+    // ── writable (user input): `&State<S>`, call `.update(..)` ──
+    pub select_click:          Option<Box<dyn Fn(MenuLayerRef, &State<S>, &MenuIndex)>>,
+    pub select_long_click:     Option<Box<dyn Fn(MenuLayerRef, &State<S>, &MenuIndex)>>,
+    /// Args are `(old_index, new_index)`.
+    pub selection_changed:     Option<Box<dyn Fn(MenuLayerRef, &State<S>, MenuIndex, MenuIndex)>>,
 }
 
 impl<S> Default for MenuCallbacks<S> {
     fn default() -> Self {
         MenuCallbacks {
-            get_num_sections:  None,
-            get_num_rows:      None,
-            get_cell_height:   None,
-            get_header_height: None,
-            draw_row:          None,
-            draw_header:       None,
-            select_click:      None,
+            get_num_sections:      None,
+            get_num_rows:          None,
+            get_cell_height:       None,
+            get_header_height:     None,
+            get_separator_height:  None,
+            draw_row:              None,
+            draw_header:           None,
+            draw_separator:        None,
+            draw_background:       None,
+            selection_will_change: None,
+            select_click:          None,
+            select_long_click:     None,
+            selection_changed:     None,
         }
     }
 }
 
 struct MenuCtx<S> {
-    shared: Shared<S>,
-    cbs:    MenuCallbacks<S>,
+    state: State<S>,
+    cbs:   MenuCallbacks<S>,
 }
 
 pub struct Menu<S: 'static> {
@@ -196,17 +218,22 @@ pub struct Menu<S: 'static> {
 }
 
 impl<S: 'static> Menu<S> {
-    pub fn new(frame: GRect, ctx: &ScreenCtx<S>, cbs: MenuCallbacks<S>) -> Self {
-        let mut mc = Box::new(MenuCtx { shared: ctx.shared(), cbs });
+    pub fn new(frame: GRect, state: &State<S>, cbs: MenuCallbacks<S>) -> Self {
+        let mut mc = Box::new(MenuCtx { state: state.clone(), cbs });
         let typed = TypedMenuCallbacks::<MenuCtx<S>> {
-            get_num_sections:  mc.cbs.get_num_sections .as_ref().map(|_| t_num_sections::<S>  as fn(MenuLayerRef, &MenuCtx<S>) -> u16),
-            get_num_rows:      mc.cbs.get_num_rows     .as_ref().map(|_| t_num_rows::<S>      as fn(MenuLayerRef, &MenuCtx<S>, u16) -> u16),
-            get_cell_height:   mc.cbs.get_cell_height  .as_ref().map(|_| t_cell_height::<S>   as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex) -> i16),
-            get_header_height: mc.cbs.get_header_height.as_ref().map(|_| t_header_height::<S> as fn(MenuLayerRef, &MenuCtx<S>, u16) -> i16),
-            draw_row:          mc.cbs.draw_row         .as_ref().map(|_| t_draw_row::<S>      as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &MenuCtx<S>)),
-            draw_header:       mc.cbs.draw_header      .as_ref().map(|_| t_draw_header::<S>   as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, u16, &MenuCtx<S>)),
-            select_click:      mc.cbs.select_click     .as_ref().map(|_| t_select_click::<S>  as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex)),
-            ..TypedMenuCallbacks::default()
+            get_num_sections:      mc.cbs.get_num_sections     .as_ref().map(|_| t_num_sections::<S>        as fn(MenuLayerRef, &MenuCtx<S>) -> u16),
+            get_num_rows:          mc.cbs.get_num_rows         .as_ref().map(|_| t_num_rows::<S>            as fn(MenuLayerRef, &MenuCtx<S>, u16) -> u16),
+            get_cell_height:       mc.cbs.get_cell_height      .as_ref().map(|_| t_cell_height::<S>         as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex) -> i16),
+            get_header_height:     mc.cbs.get_header_height    .as_ref().map(|_| t_header_height::<S>       as fn(MenuLayerRef, &MenuCtx<S>, u16) -> i16),
+            get_separator_height:  mc.cbs.get_separator_height .as_ref().map(|_| t_separator_height::<S>    as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex) -> i16),
+            draw_row:              mc.cbs.draw_row             .as_ref().map(|_| t_draw_row::<S>            as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &MenuCtx<S>)),
+            draw_header:           mc.cbs.draw_header          .as_ref().map(|_| t_draw_header::<S>         as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, u16, &MenuCtx<S>)),
+            draw_separator:        mc.cbs.draw_separator       .as_ref().map(|_| t_draw_separator::<S>      as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, &MenuIndex, &MenuCtx<S>)),
+            draw_background:       mc.cbs.draw_background       .as_ref().map(|_| t_draw_background::<S>     as fn(MenuLayerRef, &mut GContext, &MenuCellLayer, bool, &MenuCtx<S>)),
+            selection_will_change: mc.cbs.selection_will_change.as_ref().map(|_| t_selection_will_change::<S> as fn(MenuLayerRef, &MenuCtx<S>, &mut MenuIndex, MenuIndex)),
+            select_click:          mc.cbs.select_click         .as_ref().map(|_| t_select_click::<S>        as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex)),
+            select_long_click:     mc.cbs.select_long_click    .as_ref().map(|_| t_select_long_click::<S>   as fn(MenuLayerRef, &MenuCtx<S>, &MenuIndex)),
+            selection_changed:     mc.cbs.selection_changed    .as_ref().map(|_| t_selection_changed::<S>   as fn(MenuLayerRef, &MenuCtx<S>, MenuIndex, MenuIndex)),
         };
         let ptr: *mut MenuCtx<S> = &mut *mc;
         let inner = pebble::layer::MenuLayer::new(frame, ptr, typed);
@@ -243,24 +270,46 @@ impl<S: 'static> AsLayer for Menu<S> {
     }
 }
 
-fn t_num_sections<S>(menu: MenuLayerRef, mc: &MenuCtx<S>) -> u16 {
-    (mc.cbs.get_num_sections.as_ref().unwrap())(menu, &mc.shared.borrow())
+// Read-only trampolines borrow `&S` for the call via `mc.state.read()`.
+fn t_num_sections<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>) -> u16 {
+    (mc.cbs.get_num_sections.as_ref().unwrap())(menu, &mc.state.read())
 }
-fn t_num_rows<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, section: u16) -> u16 {
-    (mc.cbs.get_num_rows.as_ref().unwrap())(menu, &mc.shared.borrow(), section)
+fn t_num_rows<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, section: u16) -> u16 {
+    (mc.cbs.get_num_rows.as_ref().unwrap())(menu, &mc.state.read(), section)
 }
-fn t_cell_height<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) -> i16 {
-    (mc.cbs.get_cell_height.as_ref().unwrap())(menu, &mc.shared.borrow(), idx)
+fn t_cell_height<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) -> i16 {
+    (mc.cbs.get_cell_height.as_ref().unwrap())(menu, &mc.state.read(), idx)
 }
-fn t_header_height<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, section: u16) -> i16 {
-    (mc.cbs.get_header_height.as_ref().unwrap())(menu, &mc.shared.borrow(), section)
+fn t_header_height<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, section: u16) -> i16 {
+    (mc.cbs.get_header_height.as_ref().unwrap())(menu, &mc.state.read(), section)
 }
-fn t_draw_row<S>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, idx: &MenuIndex, mc: &MenuCtx<S>) {
-    (mc.cbs.draw_row.as_ref().unwrap())(menu, g, cell, idx, &mc.shared.borrow())
+fn t_separator_height<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) -> i16 {
+    (mc.cbs.get_separator_height.as_ref().unwrap())(menu, &mc.state.read(), idx)
 }
-fn t_draw_header<S>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, section: u16, mc: &MenuCtx<S>) {
-    (mc.cbs.draw_header.as_ref().unwrap())(menu, g, cell, section, &mc.shared.borrow())
+fn t_draw_row<S: 'static>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, idx: &MenuIndex, mc: &MenuCtx<S>) {
+    (mc.cbs.draw_row.as_ref().unwrap())(menu, g, cell, idx, &mc.state.read())
 }
-fn t_select_click<S>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) {
-    (mc.cbs.select_click.as_ref().unwrap())(menu, &mc.shared.borrow(), idx)
+fn t_draw_header<S: 'static>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, section: u16, mc: &MenuCtx<S>) {
+    (mc.cbs.draw_header.as_ref().unwrap())(menu, g, cell, section, &mc.state.read())
+}
+fn t_draw_separator<S: 'static>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, idx: &MenuIndex, mc: &MenuCtx<S>) {
+    (mc.cbs.draw_separator.as_ref().unwrap())(menu, g, cell, idx, &mc.state.read())
+}
+fn t_draw_background<S: 'static>(menu: MenuLayerRef, g: &mut GContext, cell: &MenuCellLayer, highlighted: bool, mc: &MenuCtx<S>) {
+    (mc.cbs.draw_background.as_ref().unwrap())(menu, g, cell, highlighted, &mc.state.read())
+}
+fn t_selection_will_change<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, next_idx: &mut MenuIndex, current_idx: MenuIndex) {
+    (mc.cbs.selection_will_change.as_ref().unwrap())(menu, &mc.state.read(), next_idx, current_idx)
+}
+
+// Writable trampolines hand the user the `State` handle (call `.update(..)`).
+fn t_select_click<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) {
+    (mc.cbs.select_click.as_ref().unwrap())(menu, &mc.state, idx)
+}
+fn t_select_long_click<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, idx: &MenuIndex) {
+    (mc.cbs.select_long_click.as_ref().unwrap())(menu, &mc.state, idx)
+}
+// pebble-rust forwards `(new_index, old_index)`; the public order is `(old, new)`.
+fn t_selection_changed<S: 'static>(menu: MenuLayerRef, mc: &MenuCtx<S>, new_idx: MenuIndex, old_idx: MenuIndex) {
+    (mc.cbs.selection_changed.as_ref().unwrap())(menu, &mc.state, old_idx, new_idx)
 }

@@ -3,6 +3,7 @@
 #![feature(associated_type_defaults)]
 
 extern crate alloc;
+#[macro_use]
 extern crate pebble_rust as pebble;
 
 // Taconite — reactive screen framework for Pebble apps built with pebble-rust.
@@ -13,14 +14,15 @@ extern crate pebble_rust as pebble;
 // small router table maps window IDs to bundles so AppMessages can be delivered
 // to the correct screen even when it is not at the front of the stack.
 
-pub mod cell;
 pub mod layer;
+pub mod state;
+
+pub use state::State;
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::ops::Deref;
-use cell::ReCell;
 
 use pebble::{window, WindowPtr};
 use pebble::app_message::{AppMessage, AppMessageDict, Dictionary};
@@ -29,7 +31,7 @@ use pebble::layer::Layer;
 use pebble::click::{ClickCallbacks, WindowClickHandler};
 
 /// State shared between a screen and its layers. Cloning is a cheap refcount bump.
-pub type Shared<S> = Rc<ReCell<S>>;
+pub type Shared<S> = Rc<RefCell<S>>;
 
 /// Message keys reserved by taconite. Include all of these in your app's
 /// `messageKeys` in `package.json` with the exact numeric values shown.
@@ -65,17 +67,47 @@ pub struct ScreenCtx<S> {
     window:        window::Window,
     layers_ptr:    Cell<*const ()>,                                   // type-erased Layers, set after build
     view_fn:       fn(&S, *const ()),                                 // monomorphized -> Sc::view
-    click:         ReCell<Option<WindowClickHandler<ScreenCtx<S>>>>, // kept alive for the screen's life
+    click:         RefCell<Option<WindowClickHandler<ScreenCtx<S>>>>, // kept alive for the screen's life
+    handle:        RefCell<Option<State<S>>>,                         // cached root `State`, built on first `state()`
 }
 
-impl<S> ScreenCtx<S> {
+impl<S: 'static> ScreenCtx<S> {
     /// A cheap shared handle to the state, for layer wrappers.
+    #[deprecated(note = "use `state()`; layers should take a `State<S>`")]
     pub fn shared(&self) -> Shared<S> { self.state.clone() }
 
     pub fn root(&self) -> &Layer { &self.root }
     pub fn window(&self) -> &window::Window { &self.window }
 
+    /// The reactive handle to this screen's state — the currency every layer and
+    /// writable callback takes. Reads at paint time, `update`s with a repaint, and
+    /// `split_field`s into sub-states. Built once and cached (cloning is cheap).
+    pub fn state(&self) -> State<S> {
+        let mut cached = self.handle.borrow_mut();
+        if let Some(handle) = cached.as_ref() {
+            return handle.clone();
+        }
+        // `rerender` re-runs `view` against current state. It reads `layers_ptr`
+        // *lazily* (via a raw pointer into this boxed, stable `ScreenCtx`), so it
+        // works even though `layers_ptr` is still null while `create_window` runs;
+        // and it captures only the state cell (no `Rc` back to the ctx → no cycle).
+        let cell      = self.state.clone();
+        let cell_view = cell.clone();
+        let view_fn   = self.view_fn;
+        let lp: *const Cell<*const ()> = &self.layers_ptr;
+        let rerender: Rc<dyn Fn()> = Rc::new(move || {
+            let layers = unsafe { (*lp).get() };
+            if !layers.is_null() {
+                view_fn(&cell_view.borrow(), layers);
+            }
+        });
+        let handle = State::root(cell, rerender);
+        *cached = Some(handle.clone());
+        handle
+    }
+
     /// Read the state.
+    #[deprecated(note = "use `state().with(..)` or `state().read()`")]
     pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> R {
         f(&self.state.borrow())
     }
@@ -86,18 +118,15 @@ impl<S> ScreenCtx<S> {
         if lp.is_null() { None } else { Some(unsafe { &*(lp as *const L) }) }
     }
 
-    /// Mutate the state with `f` and re-render. Returns `f`'s value.
+    /// Mutate the state with `f` and re-render — a thin delegator to
+    /// `state().update(..)`, so there's a single update+repaint path.
     ///
     /// (Data arriving over several AppMessages should accumulate via
     /// `ScreenMessageCtx::update_temp` and land in one `commit`, so the rendered
     /// state is never caught half-assembled — see `ScreenMessageCtx`.)
-    pub fn update<R>(&self, f: impl FnOnce(&mut S) -> R) -> R {
-        let r = f(&mut self.state.borrow_mut());   // borrow_mut dropped at the `;`
-        let lp = self.layers_ptr.get();
-        if !lp.is_null() {
-            (self.view_fn)(&self.state.borrow(), lp);  // safe to borrow() now
-        }
-        r
+    #[deprecated(note = "use `state().update(..)`")]
+    pub fn update(&self, f: impl FnOnce(&mut S)) {
+        self.state().update(f);
     }
 
     /// Wire up click handlers for this screen. Call from `configure_clicks`.
@@ -116,7 +145,7 @@ impl<S> ScreenCtx<S> {
 /// one atomic `commit` — the rendered `State` is never caught half-built.
 pub struct ScreenMessageCtx<'a, S, T> {
     ctx:  &'a ScreenCtx<S>,
-    temp: &'a ReCell<T>,
+    temp: &'a RefCell<T>,
 }
 
 impl<S, T> Deref for ScreenMessageCtx<'_, S, T> {
@@ -128,6 +157,11 @@ impl<S, T: Default> ScreenMessageCtx<'_, S, T> {
     /// Accumulate into the off-screen staging buffer. Never re-renders (nothing
     /// draws from `TempState`). Returns `f`'s value — e.g. the completeness `bool`
     /// from `handle_list_message`, so you can decide when to `commit`.
+    ///
+    /// (Cleanup-pending, like `update`/`with`: the intended end state is `temp`
+    /// becoming a `State<T>` and this a `State::mutate`. Not attributed
+    /// `#[deprecated]` yet because no `State`-based replacement exists — temp is
+    /// still a plain `RefCell`. `commit` stays first-class regardless.)
     pub fn update_temp<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         f(&mut self.temp.borrow_mut())
     }
@@ -184,7 +218,7 @@ pub trait ScreenFns {
 
 struct ScreenBundle {
     ctx_ptr:                  *mut (),   // Box<ScreenCtx<Sc::State>>
-    temp_ptr:                 *mut (),   // Box<ReCell<Sc::TempState>>
+    temp_ptr:                 *mut (),   // Box<RefCell<Sc::TempState>>
     window_id:                u8,
     on_load:                  fn(*mut (), WindowPtr),
     on_message:               fn(*mut (), *mut (), &AppMessageDict),
@@ -234,17 +268,18 @@ pub fn push_screen<Sc: ScreenFns>(initial_state: Sc::State, animate: bool) {
     let root = win.get_root_layer();
 
     let ctx = Box::new(ScreenCtx::<Sc::State> {
-        state:      Rc::new(ReCell::new(initial_state)),
+        state:      Rc::new(RefCell::new(initial_state)),
         window_id,
         root,
         window:     window::Window::from_raw(win.raw()),
         layers_ptr: Cell::new(core::ptr::null()),
         view_fn:    view_trampoline::<Sc>,
-        click:      ReCell::new(None),
+        click:      RefCell::new(None),
+        handle:     RefCell::new(None),
     });
     let ctx_ptr = Box::into_raw(ctx) as *mut ();
 
-    let temp_ptr = Box::into_raw(Box::new(ReCell::new(Sc::TempState::default()))) as *mut ();
+    let temp_ptr = Box::into_raw(Box::new(RefCell::new(Sc::TempState::default()))) as *mut ();
 
     let bundle = Box::new(ScreenBundle {
         ctx_ptr,
@@ -404,7 +439,7 @@ fn on_load_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), _window_ptr: WindowPtr) {
 
 fn on_message_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), temp_ptr: *mut (), dict: &AppMessageDict) {
     let ctx  = ctx_ref::<Sc>(ctx_ptr);
-    let temp = unsafe { &*(temp_ptr as *const ReCell<Sc::TempState>) };
+    let temp = unsafe { &*(temp_ptr as *const RefCell<Sc::TempState>) };
     let mctx = ScreenMessageCtx { ctx, temp };
     Sc::on_message(&mctx, dict);
 }
@@ -437,5 +472,5 @@ fn on_drop_trampoline<Sc: ScreenFns>(ctx_ptr: *mut (), temp_ptr: *mut ()) {
     }
     // free the ScreenCtx box (drops state Rc + click handler) and the TempState box
     unsafe { drop(Box::from_raw(ctx_ptr as *mut ScreenCtx<Sc::State>)); }
-    unsafe { drop(Box::from_raw(temp_ptr as *mut ReCell<Sc::TempState>)); }
+    unsafe { drop(Box::from_raw(temp_ptr as *mut RefCell<Sc::TempState>)); }
 }
