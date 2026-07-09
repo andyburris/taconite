@@ -35,13 +35,13 @@ impl ScreenFns for AppMessageScreen {
 
     fn create_window(ctx: &ScreenCtx<AppMessageState>) -> Self::Layers {
         let bounds = ctx.root().get_bounds();
+        let state = ctx.state();
         let text_layer = Text::new(
             GRect {
                 origin: GPoint { x: bounds.size.w / 9, y: bounds.size.h / 2 - 20 },
                 size: GSize { w: bounds.size.w, h: 20 },
             },
-            ctx,
-            |s| s.text.as_c_str(),
+            state.focus(|s| &s.text),
         );
         ctx.root().add_child(&text_layer);
         AppMessageLayers { text_layer }
@@ -62,7 +62,7 @@ impl ScreenFns for AppMessageScreen {
     fn on_message(ctx: &ScreenMessageCtx<AppMessageState, ()>, dict: &AppMessageDict) {
         if let Some(text) = dict.find_str(MESSAGE_KEY_EXAMPLE) {
             let cstring = text.to_cstring();
-            ctx.update(|s| {
+            ctx.state().update(|s| {
                 s.text = cstring;
             });
         }

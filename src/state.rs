@@ -23,7 +23,7 @@ use alloc::rc::Rc;
 use core::cell::{Ref, RefCell};
 use core::ops::Deref;
 
-use pebble::layer::{AsLayer, Layer};
+use pebble::layer::{AsLayer, LayerRef};
 use pebble::RawLayer;
 
 // ── Snap<T> — a zero-copy pointer into an immutable snapshot ──────────────────────
@@ -110,7 +110,7 @@ impl<T: ?Sized, U: ?Sized> ProjectTo<U> for FocusedSnap<T, U> {
 
 /// The erased backing of a `State<T>`. `with` is the scoped, usually alloc-free read;
 /// `snapshot` materializes a stable `Snap<T>` (what `map` hands its builder).
-trait ReadSource<T> {
+pub(crate) trait ReadSource<T> {
     fn with(&self, f: &mut dyn FnMut(&T));
     fn snapshot(&self) -> Snap<T>;
 }
@@ -150,6 +150,30 @@ impl<T: 'static> State<T> {
     pub fn map<U: 'static>(&self, f: impl Fn(&Snap<T>) -> U + 'static) -> State<U> {
         let f: Rc<dyn Fn(&Snap<T>) -> U> = Rc::new(f);
         State { inner: Rc::new(MapSrc { src: self.clone(), f }) }
+    }
+
+    /// Combine two states into one owned value. The builder gets a `Snap` of each
+    /// source (both Deref to `&A`/`&B`) and returns an owned `T`; its fields can keep
+    /// zero-copy `Snap` pointers into *either* source. This is what lets one layer read
+    /// from two cells at once — e.g. screen data plus a layer-local selection:
+    /// `State::combine(&games, &selection, |g, sel| RowData { games: g.clone(), sel: **sel })`.
+    pub fn combine<A: 'static, B: 'static>(
+        a: &State<A>,
+        b: &State<B>,
+        f: impl Fn(&Snap<A>, &Snap<B>) -> T + 'static,
+    ) -> State<T> {
+        let f: Rc<dyn Fn(&Snap<A>, &Snap<B>) -> T> = Rc::new(f);
+        State { inner: Rc::new(CombineSrc { a: a.clone(), b: b.clone(), f }) }
+    }
+
+    /// Wrap a custom `ReadSource` as a `State` (used by `AnimatedState`).
+    pub(crate) fn from_source(inner: Rc<dyn ReadSource<T>>) -> State<T> {
+        State { inner }
+    }
+
+    /// Snapshot this state's current value (used by `AnimatedState`).
+    pub(crate) fn snapshot(&self) -> Snap<T> {
+        self.inner.snapshot()
     }
 
     /// Read the value for the duration of `f` and return `f`'s result. The universal
@@ -221,6 +245,25 @@ impl<A: 'static, T: 'static> ReadSource<T> for MapSrc<A, T> {
     }
 }
 
+struct CombineSrc<A, B, T> {
+    a: State<A>,
+    b: State<B>,
+    f: Rc<dyn Fn(&Snap<A>, &Snap<B>) -> T>,
+}
+impl<A: 'static, B: 'static, T: 'static> ReadSource<T> for CombineSrc<A, B, T> {
+    fn with(&self, out: &mut dyn FnMut(&T)) {
+        let sa = self.a.inner.snapshot();
+        let sb = self.b.inner.snapshot();
+        let val = (&*self.f)(&sa, &sb);
+        out(&val);
+    }
+    fn snapshot(&self) -> Snap<T> {
+        let sa = self.a.inner.snapshot();
+        let sb = self.b.inner.snapshot();
+        Snap::whole(Rc::new((&*self.f)(&sa, &sb)))
+    }
+}
+
 // ── MutableState<T> — the writable source of truth ───────────────────────────────
 
 /// The writable reactive cell every read-only `State` ultimately derives from. Holds
@@ -254,9 +297,9 @@ impl<T: 'static> MutableState<T> {
     /// plumbing lives here, not in caller code — pass any layer you own (its root).
     pub fn for_layer(layer: &impl AsLayer, initial: T) -> Self {
         let raw: *mut RawLayer = layer.as_raw();
-        // The SDK layer pointer is stable for the layer's life; `Layer::from_raw` is a
-        // non-owning wrapper, so marking dirty through it is allocation-free.
-        MutableState::new(initial, move || Layer::from_raw(raw).mark_dirty())
+        // The SDK layer pointer is stable for the layer's life; `LayerRef` is a
+        // non-owning handle, so marking dirty through it is allocation-free.
+        MutableState::new(initial, move || LayerRef::from_raw(raw).mark_dirty())
     }
 
     /// Read the value for the duration of `f`.

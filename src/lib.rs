@@ -14,10 +14,14 @@ extern crate pebble_rust as pebble;
 // small router table maps window IDs to bundles so AppMessages can be delivered
 // to the correct screen even when it is not at the front of the stack.
 
+pub mod animation;
 pub mod layer;
 pub mod state;
 
-pub use state::{State, MutableState};
+pub use state::{State, MutableState, Snap};
+pub use animation::{AnimatedState, Interpolatable};
+// Status bar is a plain pebble-rust layer with no data binding — re-export as-is.
+pub use pebble::status_bar::{StatusBarLayer, StatusBarLayerSeparatorMode, STATUS_BAR_LAYER_HEIGHT};
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -27,13 +31,14 @@ use core::ops::Deref;
 use pebble::{window, WindowPtr};
 use pebble::app_message::{AppMessage, AppMessageDict, Dictionary};
 use pebble::types::{DictPtr, VoidPtr};
-use pebble::layer::Layer;
+use pebble::layer::LayerRef;
+use pebble::window::WindowRef;
 use pebble::click::{ClickCallbacks, WindowClickHandler};
 
 /// State shared between a screen and its layers, stored as an immutable snapshot
 /// `Rc<S>` (the `Snap` model — see `state`). Cloning the outer handle is a refcount
 /// bump; `MutableState::update` mutates the snapshot in place via `Rc::get_mut`.
-pub type Shared<S> = Rc<RefCell<Rc<S>>>;
+type Shared<S> = Rc<RefCell<Rc<S>>>;
 
 /// Message keys reserved by taconite. Include all of these in your app's
 /// `messageKeys` in `package.json` with the exact numeric values shown.
@@ -65,20 +70,16 @@ pub enum SubscriptionEvent {
 pub struct ScreenCtx<S> {
     state:         Shared<S>,
     pub window_id: u8,
-    root:          Layer,
-    window:        window::Window,
-    layers_ptr:    Cell<*const ()>,                                   // type-erased Layers, set after build
-    view_fn:       fn(&S, *const ()),                                 // monomorphized -> Sc::view
-    click:         RefCell<Option<WindowClickHandler<ScreenCtx<S>>>>, // kept alive for the screen's life
-    handle:        RefCell<Option<MutableState<S>>>,                  // cached writable root state, built on first `state()`
+    root:          LayerRef,                          // the window's root layer (non-owning)
+    window:        window::Window,                    // owned — destroyed when this ctx drops
+    layers_ptr:    Cell<*const ()>,                   // type-erased Layers, set after build
+    view_fn:       fn(&S, *const ()),                 // monomorphized -> Sc::view
+    click:         RefCell<Option<WindowClickHandler>>, // kept alive for the screen's life
+    handle:        RefCell<Option<MutableState<S>>>,  // cached writable root state, built on first `state()`
 }
 
 impl<S: 'static> ScreenCtx<S> {
-    /// A cheap shared handle to the state, for layer wrappers.
-    #[deprecated(note = "use `state()`; layers should take a `State<S>`")]
-    pub fn shared(&self) -> Shared<S> { self.state.clone() }
-
-    pub fn root(&self) -> &Layer { &self.root }
+    pub fn root(&self) -> LayerRef { self.root }
     pub fn window(&self) -> &window::Window { &self.window }
 
     /// The screen's writable reactive state — the root every layer reads from (via
@@ -109,35 +110,17 @@ impl<S: 'static> ScreenCtx<S> {
         handle
     }
 
-    /// Read the state.
-    #[deprecated(note = "use `state().with(..)` or `state().read()`")]
-    pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> R {
-        let snap = self.state.borrow();
-        f(&snap)
-    }
-
     /// The window's layers, if they have been built yet.
     pub fn layers<L>(&self) -> Option<&L> {
         let lp = self.layers_ptr.get();
         if lp.is_null() { None } else { Some(unsafe { &*(lp as *const L) }) }
     }
 
-    /// Mutate the state with `f` and re-render — a thin delegator to
-    /// `state().update(..)`, so there's a single update+repaint path.
-    ///
-    /// (Data arriving over several AppMessages should accumulate via
-    /// `ScreenMessageCtx::update_temp` and land in one `commit`, so the rendered
-    /// state is never caught half-assembled — see `ScreenMessageCtx`.)
-    #[deprecated(note = "use `state().update(..)`")]
-    pub fn update(&self, f: impl FnOnce(&mut S)) {
-        self.state().update(f);
-    }
-
-    /// Wire up click handlers for this screen. Call from `configure_clicks`.
-    /// Callbacks receive `&mut ScreenCtx<S>` and typically call `ctx.update(...)`.
-    pub fn set_clicks(&self, callbacks: ClickCallbacks<ScreenCtx<S>>) -> WindowClickHandler<ScreenCtx<S>> {
-        let ptr = self as *const ScreenCtx<S> as *mut ScreenCtx<S>;
-        self.window.set_click_handlers(ptr, callbacks)
+    /// Wire up click handlers for this screen. Call from `configure_clicks`. The
+    /// callbacks are closures that capture whatever state they need — e.g.
+    /// `let s = ctx.state(); move || s.update(..)` — so no context pointer is needed.
+    pub fn set_clicks(&self, callbacks: ClickCallbacks) -> WindowClickHandler {
+        self.window.set_click_handlers(callbacks)
     }
 }
 
@@ -222,7 +205,7 @@ pub trait ScreenFns {
     fn on_appear(_ctx: &ScreenCtx<Self::State>) {}
     fn on_disappear(_ctx: &ScreenCtx<Self::State>) {}
     fn on_drop(_ctx: &ScreenCtx<Self::State>) {}
-    fn configure_clicks(_ctx: &ScreenCtx<Self::State>) -> Option<WindowClickHandler<ScreenCtx<Self::State>>> { None }
+    fn configure_clicks(_ctx: &ScreenCtx<Self::State>) -> Option<WindowClickHandler> { None }
 }
 
 // ── Internal bundle stored in window user data (type-erased over the screen) ────
@@ -276,24 +259,26 @@ fn router_unregister(window_id: u8) {
 pub fn push_screen<Sc: ScreenFns>(initial_state: Sc::State, animate: bool) {
     let window_id = next_window_id();
     let win  = window::Window::new();
-    let root = win.get_root_layer();
+    let root = win.get_root_layer();   // LayerRef — the window (below) owns the layer
 
+    // The ScreenCtx *owns* the window now; it is destroyed when this box is freed on
+    // unload (see `on_drop_trampoline`), fixing the previous window leak.
     let ctx = Box::new(ScreenCtx::<Sc::State> {
         state:      Rc::new(RefCell::new(Rc::new(initial_state))),
         window_id,
         root,
-        window:     window::Window::from_raw(win.raw()),
+        window:     win,
         layers_ptr: Cell::new(core::ptr::null()),
         view_fn:    view_trampoline::<Sc>,
         click:      RefCell::new(None),
         handle:     RefCell::new(None),
     });
-    let ctx_ptr = Box::into_raw(ctx) as *mut ();
+    let ctx_ptr = Box::into_raw(ctx);
 
     let temp_ptr = Box::into_raw(Box::new(RefCell::new(Sc::TempState::default()))) as *mut ();
 
     let bundle = Box::new(ScreenBundle {
-        ctx_ptr,
+        ctx_ptr: ctx_ptr as *mut (),
         temp_ptr,
         window_id,
         on_load:                  on_load_trampoline::<Sc>,
@@ -308,14 +293,17 @@ pub fn push_screen<Sc: ScreenFns>(initial_state: Sc::State, animate: bool) {
 
     router_register(window_id, bundle_ptr);
 
-    win.set_user_data(bundle_ptr);
-    win.set_handlers(pebble::window::WindowHandlers {
+    // Configure and push through the now-owned window (inside the boxed ctx, so its
+    // address is stable).
+    let ctx_ref = unsafe { &*ctx_ptr };
+    ctx_ref.window.set_user_data(bundle_ptr);
+    ctx_ref.window.set_handlers(pebble::window::WindowHandlers {
         load:      pebble_ui_load,
         unload:    pebble_ui_unload,
         appear:    pebble_ui_appear,
         disappear: pebble_ui_disappear,
     });
-    win.push(animate);
+    ctx_ref.window.push(animate);
 }
 
 /// Global AppMessage inbox handler — register this with `AppMessage::register_inbox`.
@@ -397,14 +385,14 @@ pub fn send_message(key_values: &[(u32, i32)]) {
 // ── Non-generic Pebble window callbacks ──────────────────────────────────────────
 
 extern "C" fn pebble_ui_load(window_ptr: WindowPtr) {
-    let win    = window::Window::from_raw(window_ptr);
+    let win    = WindowRef::from_raw(window_ptr);
     let bundle = unsafe { &mut *win.get_user_data::<ScreenBundle>() };
     (bundle.on_load)(bundle.ctx_ptr, window_ptr);
     (bundle.configure_clicks)(bundle.ctx_ptr);
 }
 
 extern "C" fn pebble_ui_unload(window_ptr: WindowPtr) {
-    let win        = window::Window::from_raw(window_ptr);
+    let win        = WindowRef::from_raw(window_ptr);
     let bundle_ptr = win.get_user_data::<ScreenBundle>();
     let bundle     = unsafe { &mut *bundle_ptr };
 
@@ -414,13 +402,13 @@ extern "C" fn pebble_ui_unload(window_ptr: WindowPtr) {
 }
 
 extern "C" fn pebble_ui_appear(window_ptr: WindowPtr) {
-    let win    = window::Window::from_raw(window_ptr);
+    let win    = WindowRef::from_raw(window_ptr);
     let bundle = unsafe { &mut *win.get_user_data::<ScreenBundle>() };
     (bundle.on_appear)(bundle.ctx_ptr);
 }
 
 extern "C" fn pebble_ui_disappear(window_ptr: WindowPtr) {
-    let win    = window::Window::from_raw(window_ptr);
+    let win    = WindowRef::from_raw(window_ptr);
     let bundle = unsafe { &mut *win.get_user_data::<ScreenBundle>() };
     (bundle.on_disappear)(bundle.ctx_ptr);
 }
