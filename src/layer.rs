@@ -335,8 +335,8 @@ impl ContentIndicatorLayer {
         root.add_child(&down_host);
 
         let indicator = ContentIndicator::new();
-        indicator.configure_direction(ContentIndicatorDirection::Up, &up_host, false, GAlign::Center, GColor::Black, GColor::White);
-        indicator.configure_direction(ContentIndicatorDirection::Down, &down_host, false, GAlign::Center, GColor::Black, GColor::White);
+        indicator.configure_direction(ContentIndicatorDirection::Up, &up_host, false, GAlign::Center, GColor::Black, GColor::Clear);
+        indicator.configure_direction(ContentIndicatorDirection::Down, &down_host, false, GAlign::Center, GColor::Black, GColor::Clear);
 
         let me = ContentIndicatorLayer {
             root, _up_host: up_host, _down_host: down_host, indicator,

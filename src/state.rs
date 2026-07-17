@@ -328,7 +328,7 @@ impl<T: 'static> MutableState<T> {
         let mut cell = match self.cell.try_borrow_mut() {
             Ok(c) => c,
             Err(_) => {
-                pbl_err!("taconite: state updated during render - move this out of a draw/read callback");
+                pbl_err!("taconite: update during render");
                 return;
             }
         };
@@ -339,7 +339,7 @@ impl<T: 'static> MutableState<T> {
                 (self.rerender)();
             }
             None => {
-                pbl_err!("taconite: state updated while a Snap of it is held - don't store Snaps across updates");
+                pbl_err!("taconite: update while Snap held");
             }
         }
     }

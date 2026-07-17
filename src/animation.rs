@@ -72,6 +72,11 @@ impl<T: Interpolatable + 'static> Shared<T> {
                 book.current = Some(from);
                 book.target = Some(new_target);
 
+                // A fresh `Animation` per retarget: Pebble animations are immutable
+                // once scheduled and are auto-destroyed by the firmware when they
+                // stop, so a scheduled animation can't be reconfigured or reused.
+                // Assigning replaces (and drops) any in-flight one.
+                //
                 // The frame closure holds a `Weak` so `Shared` → `book` → `anim` →
                 // closure isn't a strong cycle (which would leak the animation).
                 let weak = Rc::downgrade(self);
@@ -89,7 +94,7 @@ impl<T: Interpolatable + 'static> Shared<T> {
                 anim.set_duration(self.duration.get());
                 anim.set_curve(self.curve.get());
                 anim.schedule();
-                book.anim = Some(anim);   // replaces (cancels + destroys) any prior one
+                book.anim = Some(anim);
                 from
             }
         }
