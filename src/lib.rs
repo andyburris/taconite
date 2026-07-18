@@ -19,7 +19,7 @@ pub mod layer;
 pub mod state;
 
 pub use state::{State, MutableState, Snap};
-pub use animation::{AnimatedState, Interpolatable};
+pub use animation::{AnimatedState, Interpolatable, LoopingState};
 // Status bar is a plain pebble-rust layer with no data binding — re-export as-is.
 pub use pebble::status_bar::{StatusBarLayer, StatusBarLayerSeparatorMode, STATUS_BAR_LAYER_HEIGHT};
 
